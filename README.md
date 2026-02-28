@@ -1,76 +1,73 @@
 # KindPath DFTE — Dual Field Trading Engine
 
-Synthesises two independent field readings into unified trade signals.
-
 ```
-KEPE (World Field Score) × BMR (Market Field Score) → DFTE → Trade
+M = [(Participant × Institutional × Sovereign) · ν]²     ← BMR
+E = [(Me × Community × Country) · ν]²                    ← KEPE
+Trade = f(MFS, WFS) | governance gate | execution
 ```
 
-**The core insight:** MFS without WFS = technical without ethics. WFS without MFS = impact without timing. Both fields must agree before a position is taken.
+The first syntropy-governed, benevolence-first trading engine.
+A trade only executes when both the price field (BMR) and the world field (KEPE) align.
 
 ## Architecture
 
 ```
 kepe/
-  indicators.py       — World field data feeds (ecological, social, narrative, macro)
-  syntropy_engine.py  — SPI, WFS, OPC, EI, FGT, IL, UCS synthesis
+  indicators.py        — World field data feeds (ecological, social, narrative, macro)
+  syntropy_engine.py   — SPI, WFS, OPC, EI, IL, UCS doctrine computations
 
 dfte/
-  dfte_engine.py      — Dual field signal synthesis + trade decision + sizing
+  dfte_engine.py       — Unified signal synthesis + gate logic + position sizing
 
 governance/
-  governance_layer.py — Benevolence scoring, contradiction detection, influence tracking
+  governance_layer.py  — Benevolence scoring, contradiction detection, influence tracking
 
 wallet/
-  wallet.py           — PaperWallet + AlpacaWallet execution layer
+  wallet.py            — PaperWallet + AlpacaWallet execution abstraction
 
-orchestrator.py       — Full pipeline runner + rich terminal dashboard
-tests/test_dfte.py    — 46/46 passing
+orchestrator.py        — Main entry point: KEPE + BMR → DFTE → governance → wallet
+tests/
+  test_dfte.py         — 46/46 passing test suite
 ```
 
-## Quick Start
+## Running
 
+Start BMR server first (in kindpath-bmr/):
 ```bash
-# 1. Start BMR signal server (in kindpath-bmr repo)
-cd ../kindpath-bmr && python bmr_server.py
-
-# 2. Run DFTE analysis (paper mode, no credentials needed)
-cd kindpath-dfte
-pip install -r requirements.txt
-python orchestrator.py --symbols SPY QQQ GLD BTC-USD
-
-# 3. Syntropic asset basket
-python orchestrator.py --symbols ICLN NEE ENPH FSLR
-
-# 4. Continuous watch mode
-python orchestrator.py --symbols SPY GLD --watch
+cd kindpath-bmr && python bmr_server.py
 ```
 
-## Trade Tiers
+Then run DFTE:
+```bash
+cd kindpath-dfte
+python orchestrator.py --symbols SPY QQQ GLD BTC-USD
+python orchestrator.py --symbols ICLN NEE ENPH --mode paper  # syntropic basket
+python orchestrator.py --symbols SPY --execute --mode paper   # paper execute
+python orchestrator.py --watch --symbols SPY QQQ GLD          # continuous loop
+```
 
-| Tier  | Requires | Governed by |
-|-------|----------|-------------|
-| NANO  | ν > 0, not SIC | Market physics only. No extractive assets. |
-| MID   | ν ≥ 0.35, WFS ≥ 0.35 | Both fields present. IL < 0.65. |
-| LARGE | ν ≥ 0.55, WFS ≥ 0.55, SPI ≥ 0.45 | Impact-first. Syntropic preferred. Extractive blocked. |
+## Trade Tier Logic
 
-## Governance
+| Tier  | MFS req | WFS req | ν req  | Notes |
+|-------|---------|---------|--------|-------|
+| NANO  | any     | any     | any    | Pure market physics. Extractive blocked. |
+| MID   | ≥ 0.50  | ≥ 0.35  | ≥ 0.35 | WFS modulates MFS conviction |
+| LARGE | ≥ 0.65  | ≥ 0.55  | ≥ 0.55 | Impact-first. Syntropic preferred. Extractive blocked. |
+| WAIT  | —       | —       | —      | Field incoherent or SIC event |
 
-Every trade gates through:
-1. **MFS Gate** — market field coherence (ν threshold per tier)
-2. **WFS Gate** — world field quality (WFS + SPI threshold per tier)
-3. **Governance Gate** — benevolence score, extractive block, contradiction check
+## Doctrine Mappings (from Copilot brief)
 
-Extractive assets (weapons, fossil fuel, private prison, tobacco, predatory lending) are permanently blocked from LARGE tier and flagged in all tiers.
+| KindPath Concept | Computation |
+|-----------------|-------------|
+| IN (Insecure Neutrality) | Entropy Indicator (EI) |
+| ZPB | Syntropy Potential Index (SPI) |
+| Curvature | Field Gradient Tensor (FGT) + Market Curvature Index (K) |
+| Contradiction | Interference Load (IL) |
+| Placebo of kindness | Optimism Propagation Coefficient (OPC) |
+| System coherence | Unified Curvature Score (UCS) |
 
 ## The Feedback Loop
 
-DFTE doesn't just read the field. At scale, its positions contribute to the field it reads.
-Large impact-first positions in syntropic sectors reinforce participant-layer signals in BMR.
-This is the KindPath benevolence propagation mechanism operating through capital.
-
-## Integration
-
-BMR Server: `http://localhost:8001` (configurable via `--bmr-server`)
-Alpaca (paper): Set `ALPACA_API_KEY` + `ALPACA_SECRET_KEY`
-FRED (macro):   Set `FRED_API_KEY` (free at fred.stlouisfed.org)
+Trades → participant-scale signal in BMR → updated ν → refined MFS
+At scale: coordinated impact-first investment creates coherence in syntropic assets.
+The system doesn't just read the field. It contributes to the field it reads.

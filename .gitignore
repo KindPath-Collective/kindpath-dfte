@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 .env
-/tmp/
+.pytest_cache/
+/tmp/kepe_cache/
+/tmp/dfte_*.json
 *.log
 .DS_Store
