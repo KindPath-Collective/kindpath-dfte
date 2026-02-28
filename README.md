@@ -12,6 +12,12 @@ A trade only executes when both the price field (BMR) and the world field (KEPE)
 ## Architecture
 
 ```
+bmr/
+  bmr_server.py        — FastAPI signal server (BMR pipeline REST API)
+  core/                — Normaliser, ν engine, LSII, curvature, profile synthesiser
+  feeds/               — Raw data ingestors (market data, COT, options, macro)
+  tests/               — BMR unit tests
+
 kepe/
   indicators.py        — World field data feeds (ecological, social, narrative, macro)
   syntropy_engine.py   — SPI, WFS, OPC, EI, IL, UCS doctrine computations
@@ -32,14 +38,13 @@ tests/
 
 ## Running
 
-Start BMR server first (in kindpath-bmr/):
+Start the BMR signal server:
 ```bash
-cd kindpath-bmr && python bmr_server.py
+cd bmr && python bmr_server.py
 ```
 
 Then run DFTE:
 ```bash
-cd kindpath-dfte
 python orchestrator.py --symbols SPY QQQ GLD BTC-USD
 python orchestrator.py --symbols ICLN NEE ENPH --mode paper  # syntropic basket
 python orchestrator.py --symbols SPY --execute --mode paper   # paper execute
