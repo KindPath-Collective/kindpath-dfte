@@ -244,20 +244,141 @@ def _print_plain(report: BacktestReport) -> None:
         print(f"  - {rec}")
 
 
+def _run_live_backtest(symbols: list) -> None:
+    """
+    --live mode: validate against signals logged to signal_history.db.
+    Reads real ν, WFS, STS values logged by the orchestrator and
+    computes accuracy vs actual forward returns (via outcomes table).
+    Requires outcome_updater.py to have been run first.
+    """
+    try:
+        from logger.signal_logger import SignalLogger
+    except ImportError:
+        print("ERROR: logger module not found. Run from kindpath-dfte root.")
+        return
+
+    sl = SignalLogger()
+    stats = sl.get_stats()
+
+    try:
+        from rich.console import Console
+        from rich.panel import Panel
+        console = Console()
+    except ImportError:
+        console = None
+
+    n_total    = stats["total_signals"]
+    n_complete = stats["outcomes_complete"]
+    n_ready    = stats["validation_ready_count"]
+
+    header = (
+        f"[bold]Live signal database:[/bold] {sl.db_path}\n"
+        f"[bold]Total signals logged:[/bold]  {n_total}\n"
+        f"[bold]Outcomes complete:[/bold]     {n_complete}\n"
+        f"[bold]Validation-ready:[/bold]      {n_ready} (≥60 days old)\n"
+        f"[bold]Symbols in DB:[/bold]         {', '.join(stats['symbols']) or 'none'}\n"
+        f"[bold]Date range:[/bold]            "
+        f"{stats.get('earliest_signal', 'none')[:10] if stats.get('earliest_signal') else 'none'}"
+        f" → {stats.get('latest_signal', 'none')[:10] if stats.get('latest_signal') else 'none'}"
+    )
+
+    if console:
+        console.print(Panel(
+            header,
+            title="[bold cyan]Live Backtest — Signal Logger Status[/bold cyan]",
+            border_style="cyan",
+        ))
+    else:
+        print(header)
+
+    if n_complete < 10:
+        msg = (
+            f"\nInsufficient outcome data for live backtest validation.\n"
+            f"  Outcomes complete: {n_complete} (need ≥10)\n"
+            f"  Run `python3 logger/outcome_updater.py` to populate outcomes\n"
+            f"  for signals older than 60 days.\n\n"
+            f"  KINDFIELD: the real backtesting begins after 6 months of logging.\n"
+            f"  Price-proxy approximations cannot validate what live signal data can."
+        )
+        if console:
+            console.print(f"[yellow]{msg}[/yellow]")
+        else:
+            print(msg)
+        return
+
+    # Enough data — compute live accuracy
+    try:
+        df = sl.to_dataframe(days=730, include_outcomes=True)
+    except RuntimeError:
+        print("pandas required for live backtest: pip install pandas")
+        return
+
+    df_complete = df[df["forward_60d"].notna()].copy()
+
+    if console:
+        console.print(
+            f"\n[bold]Analysing {len(df_complete)} completed signals "
+            f"across {df_complete['symbol'].nunique()} symbols...[/bold]"
+        )
+
+    # ν live validation: compare ν quartile to forward_20d return
+    import numpy as np
+    quartile_bins = {"LOW": (0, 0.35), "MID": (0.35, 0.55),
+                     "HIGH": (0.55, 0.75), "ZPB": (0.75, 1.01)}
+
+    lines = []
+    for sym in sorted(df_complete["symbol"].unique()):
+        if symbols and sym not in symbols:
+            continue
+        sub = df_complete[df_complete["symbol"] == sym]
+        nu_vals = sub["nu"].dropna().values
+        ret_20  = sub["forward_20d"].dropna().values
+        n_sym   = min(len(nu_vals), len(ret_20))
+        if n_sym < 5:
+            continue
+        r = float(np.corrcoef(nu_vals[:n_sym], ret_20[:n_sym])[0, 1])
+        lines.append(
+            f"  [bold]{sym:<8}[/bold] n={n_sym}  "
+            f"ν↔20d_return r=[{'green' if r > 0.1 else 'red' if r < -0.1 else 'dim'}]"
+            f"{r:+.3f}[/]  "
+            f"mean_ν={nu_vals.mean():.2f}  "
+            f"mean_20d={ret_20.mean():+.4f}"
+        )
+
+    if lines and console:
+        console.print(Panel(
+            "\n".join(lines),
+            title="[bold magenta]Live ν Validation (real signal data)[/bold magenta]",
+            border_style="magenta",
+        ))
+
+    print(
+        f"\nLive backtest complete. Run `python3 logger/outcome_updater.py` "
+        f"regularly to add outcome data as signals age."
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="DFTE Phase 7 Backtesting Harness")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--quick",   action="store_true",
-                       help="SPY only — fast validation")
+                       help="SPY only — fast price-proxy validation")
     group.add_argument("--full",    action="store_true",
-                       help="All 8 symbols, full report")
+                       help="All 8 symbols, full price-proxy report")
     group.add_argument("--symbols", nargs="+",
                        help="Custom symbol list")
+    group.add_argument("--live",    action="store_true",
+                       help="Validate against real logged signals (requires 60+ day history)")
     parser.add_argument("--period", default="2y",
-                        help="yfinance period string (default: 2y)")
+                        help="yfinance period string for price-proxy mode (default: 2y)")
     parser.add_argument("--no-save", action="store_true",
                         help="Do not save JSON report")
     args = parser.parse_args()
+
+    if args.live:
+        live_symbols = args.symbols or []
+        _run_live_backtest(live_symbols)
+        return
 
     if args.quick:
         symbols = QUICK_SYMBOLS

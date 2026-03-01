@@ -60,6 +60,7 @@ from kepe.kpre_language import KPRELanguageLayer
 from kepe.syntropy_engine import synthesise_kepe_profile, KEPEProfile
 from cmam.cmam_engine import CMAMEngine, CMAMProfile, TradeClassification
 from sas.sas_engine import SASEngine, SASProfile
+from logger.signal_logger import SignalLogger
 from dfte.dfte_engine import (
     BMRSummary, KEPESummary, synthesise_dfte_signal, DFTESignal
 )
@@ -386,6 +387,7 @@ def run_basket(
     base_risk_pct: float = 1.0,
     execute: bool = False,
     wallet_mode: str = "paper",
+    signal_logger: Optional[SignalLogger] = None,
 ) -> tuple:
     """
     Analyse and optionally execute a basket of symbols.
@@ -465,6 +467,18 @@ def run_basket(
             # Track short book usage
             if sig.action == "SELL" and sig.position_size_pct > 0:
                 short_used += fund_value * (sig.position_size_pct / 100.0)
+
+        # Log signal to history database
+        if signal_logger is not None:
+            signal_logger.log_signal(
+                symbol=symbol,
+                dfte_signal=sig,
+                kepe_profile=kepe,
+                sas_profile=sas,
+                cmam_profile=cmam_profile,
+                trade_classification=tc,
+                run_mode=wallet_mode,
+            )
 
         signals[symbol] = sig
         portfolio[symbol] = sig.position_size_pct if sig.action == "BUY" else 0.0
@@ -787,6 +801,10 @@ def main():
     logger.info(f"DFTE starting — symbols: {args.symbols}")
     logger.info(f"BMR server: {BMR_SERVER} | Mode: {args.mode} | Execute: {args.execute}")
 
+    # Signal logger — logs every run to SQLite for live backtest validation
+    sig_logger = SignalLogger()
+    logger.info(f"Signal logger: {sig_logger.db_path}")
+
     if args.watch:
         while True:
             signals, cmam_profile, trade_classifications, sas_profiles = run_basket(
@@ -795,6 +813,7 @@ def main():
                 base_risk_pct=args.risk,
                 execute=args.execute,
                 wallet_mode=args.mode,
+                signal_logger=sig_logger,
             )
             print_dashboard(signals, cmam_profile, trade_classifications, sas_profiles)
             logger.info("Sleeping 5 minutes...")
@@ -806,6 +825,7 @@ def main():
             base_risk_pct=args.risk,
             execute=args.execute,
             wallet_mode=args.mode,
+            signal_logger=sig_logger,
         )
         print_dashboard(signals, cmam_profile, trade_classifications, sas_profiles)
 
