@@ -34,6 +34,7 @@ from kepe.kpre_language import (
     SECRiskDriftSignal,
     EarningsLanguageSignal,
 )
+from cmam.cmam_engine import CMAMEngine, CMAMProfile, TradeClassification
 from kepe.kpre_capital import (
     KPRECapitalLayer,
     InsiderTransactionSignal,
@@ -1166,3 +1167,217 @@ class TestKPRELanguage:
             f"Positive language signal should raise WFS: "
             f"{profile_base.wfs:.3f} → {profile_lang.wfs:.3f}"
         )
+
+
+# ─── CMAM helpers ─────────────────────────────────────────────────────────────
+
+class _MockSig:
+    """Minimal DFTESignal stand-in for CMAM classify_trade tests."""
+    def __init__(self, action="BUY", position_size_pct=2.0, rationale=""):
+        self.action = action
+        self.position_size_pct = position_size_pct
+        self.rationale = rationale
+
+
+class _MockKepe:
+    """Minimal KEPEProfile stand-in for CMAM classify_trade tests."""
+    def __init__(self, is_syntropic=False, is_extractive=False, sts="STABLE"):
+        self.is_syntropic_asset = is_syntropic
+        self.is_extractive_asset = is_extractive
+        self.sts = sts
+
+
+# ─── TestCMAM ─────────────────────────────────────────────────────────────────
+
+class TestCMAM:
+    """
+    CMAM — Capital Maturity Allocation Model.
+    All tests use synthetic data — no network calls. [TESTABLE]
+    """
+
+    def setup_method(self):
+        self.engine = CMAMEngine(x1=10_000, x2=100_000, sar_max=0.40, short_book_cap=0.15)
+
+    # ── SAR equation ──────────────────────────────────────────────────────────
+
+    def test_sar_zero_below_x1(self):
+        assert self.engine.compute_sar(5_000) == 0.0
+
+    def test_sar_zero_at_x1(self):
+        assert self.engine.compute_sar(10_000) == 0.0
+
+    def test_sar_max_at_x2(self):
+        assert self.engine.compute_sar(100_000) == pytest.approx(0.40)
+
+    def test_sar_max_above_x2(self):
+        assert self.engine.compute_sar(500_000) == pytest.approx(0.40)
+
+    def test_sar_linear_midpoint(self):
+        # midpoint = 55,000 → SAR = 0.20
+        sar = self.engine.compute_sar(55_000)
+        assert sar == pytest.approx(0.20, abs=1e-9)
+
+    def test_sar_quarter_point(self):
+        # F=32,500 → (32500-10000)/(100000-10000)*0.40 = 0.10
+        sar = self.engine.compute_sar(32_500)
+        assert sar == pytest.approx(0.10, abs=1e-9)
+
+    # ── Profile mode ──────────────────────────────────────────────────────────
+
+    def test_mode_st_below_x1(self):
+        p = self.engine.profile(5_000)
+        assert p.mode == "ST_MODE"
+        assert p.sar == 0.0
+        assert p.lt_budget == 0.0
+
+    def test_mode_transition(self):
+        p = self.engine.profile(55_000)
+        assert p.mode == "TRANSITION"
+        assert 0.0 < p.sar < 0.40
+
+    def test_mode_mature_above_x2(self):
+        p = self.engine.profile(200_000)
+        assert p.mode == "MATURE"
+        assert p.sar == pytest.approx(0.40)
+
+    # ── LT budget correctly sized from SAR ────────────────────────────────────
+
+    def test_lt_budget_at_maturity(self):
+        p = self.engine.profile(100_000)
+        assert p.lt_budget == pytest.approx(40_000.0)
+        assert p.st_budget == pytest.approx(60_000.0)
+
+    def test_lt_budget_zero_in_st_mode(self):
+        p = self.engine.profile(5_000)
+        assert p.lt_budget == 0.0
+        assert p.st_budget == pytest.approx(5_000.0)
+
+    # ── Short book cap ────────────────────────────────────────────────────────
+
+    def test_short_book_cap_enforced(self):
+        # short_used = full 15% cap
+        self.engine.profile(100_000, short_used=15_000)
+        tc = self.engine.classify_trade(
+            _MockSig(action="SELL", position_size_pct=3.0),
+            _MockKepe(is_syntropic=False, is_extractive=False, sts="STABLE"),
+        )
+        assert tc.trade_type == "BLOCKED"
+
+    def test_short_book_partial_capacity_capped(self):
+        # short_used = 10_000, cap = 15_000 → 5_000 remaining = 5%
+        self.engine.profile(100_000, short_used=10_000)
+        tc = self.engine.classify_trade(
+            _MockSig(action="SELL", position_size_pct=10.0),
+            _MockKepe(is_syntropic=False, is_extractive=False, sts="STABLE"),
+        )
+        assert tc.trade_type == "ST"
+        assert tc.max_size_pct == pytest.approx(5.0, abs=1e-9)
+
+    def test_short_profits_route_to_lt_budget(self):
+        self.engine.profile(100_000, short_used=0)
+        tc = self.engine.classify_trade(
+            _MockSig(action="SELL", position_size_pct=3.0),
+            _MockKepe(is_syntropic=False, is_extractive=False, sts="STABLE"),
+        )
+        assert tc.trade_type == "ST"
+        assert "lt_budget" in tc.routing_note.lower()
+
+    # ── LT trade blocked when STS=DETERIORATING ───────────────────────────────
+
+    def test_lt_blocked_when_sts_deteriorating(self):
+        self.engine.profile(200_000)  # mature — lt_budget available
+        tc = self.engine.classify_trade(
+            _MockSig(action="BUY", position_size_pct=5.0),
+            _MockKepe(is_syntropic=True, is_extractive=False, sts="DETERIORATING"),
+        )
+        # Syntropic but DETERIORATING → downgrade to ST, not LT
+        assert tc.trade_type == "ST"
+        assert tc.budget_source == "st_budget"
+
+    def test_lt_allowed_when_sts_loading(self):
+        self.engine.profile(200_000)
+        tc = self.engine.classify_trade(
+            _MockSig(action="BUY", position_size_pct=5.0),
+            _MockKepe(is_syntropic=True, is_extractive=False, sts="LOADING"),
+        )
+        assert tc.trade_type == "LT"
+        assert tc.budget_source == "lt_budget"
+
+    def test_lt_allowed_when_sts_stable(self):
+        self.engine.profile(200_000)
+        tc = self.engine.classify_trade(
+            _MockSig(action="BUY", position_size_pct=5.0),
+            _MockKepe(is_syntropic=True, is_extractive=False, sts="STABLE"),
+        )
+        assert tc.trade_type == "LT"
+
+    # ── Extractive hard blocked ────────────────────────────────────────────────
+
+    def test_extractive_blocked_regardless_of_fund_size(self):
+        self.engine.profile(10_000_000)  # enormous fund
+        tc = self.engine.classify_trade(
+            _MockSig(action="BUY", position_size_pct=5.0),
+            _MockKepe(is_syntropic=False, is_extractive=True, sts="LOADING"),
+        )
+        assert tc.trade_type == "BLOCKED"
+        assert tc.max_size_pct == 0.0
+
+    def test_extractive_blocked_in_st_mode(self):
+        self.engine.profile(1_000)   # tiny fund, ST mode
+        tc = self.engine.classify_trade(
+            _MockSig(action="BUY", position_size_pct=2.0),
+            _MockKepe(is_syntropic=False, is_extractive=True, sts="STABLE"),
+        )
+        assert tc.trade_type == "BLOCKED"
+
+    # ── Mirror gate ───────────────────────────────────────────────────────────
+
+    def test_mirror_gate_flags_information_asymmetry(self):
+        mc = CMAMEngine.mirror_check(
+            "trade relies on information asymmetry exploitation not available to public"
+        )
+        assert mc.passed is False
+        assert mc.flag is not None
+        assert "asymmetry" in mc.flag.lower()
+
+    def test_mirror_gate_flags_opacity(self):
+        mc = CMAMEngine.mirror_check("this trade requires opacity from regulators")
+        assert mc.passed is False
+
+    def test_mirror_gate_flags_extraction_timing(self):
+        mc = CMAMEngine.mirror_check("extraction timing gives us edge over retail")
+        assert mc.passed is False
+
+    def test_mirror_gate_passes_clean_rationale(self):
+        mc = CMAMEngine.mirror_check(
+            "syntropic momentum confirmed by KEPE and MFS convergence"
+        )
+        assert mc.passed is True
+        assert mc.flag is None
+
+    # ── Cooling-off gate ──────────────────────────────────────────────────────
+
+    def test_cooling_off_triggered_on_conversion_reasoning(self):
+        assert CMAMEngine.cooling_off_required(
+            "applying entropy to syntropy conversion to assess long-term value"
+        ) is True
+
+    def test_cooling_off_triggered_arrow_notation(self):
+        assert CMAMEngine.cooling_off_required(
+            "field analysis uses entropy→syntropy transition signal"
+        ) is True
+
+    def test_cooling_off_not_triggered_normal_rationale(self):
+        assert CMAMEngine.cooling_off_required(
+            "strong KEPE signal MFS=0.72 WFS=0.65 ν=0.89 all gates passed"
+        ) is False
+
+    # ── Safety: no profile ────────────────────────────────────────────────────
+
+    def test_classify_blocked_without_profile(self):
+        engine = CMAMEngine()   # fresh — no profile() called
+        tc = engine.classify_trade(
+            _MockSig(action="BUY", position_size_pct=2.0),
+            _MockKepe(is_syntropic=True, is_extractive=False, sts="STABLE"),
+        )
+        assert tc.trade_type == "BLOCKED"

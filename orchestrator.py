@@ -58,6 +58,7 @@ from kepe.kpre_physical import KPRELayer
 from kepe.kpre_capital import KPRECapitalLayer
 from kepe.kpre_language import KPRELanguageLayer
 from kepe.syntropy_engine import synthesise_kepe_profile, KEPEProfile
+from cmam.cmam_engine import CMAMEngine, CMAMProfile, TradeClassification
 from dfte.dfte_engine import (
     BMRSummary, KEPESummary, synthesise_dfte_signal, DFTESignal
 )
@@ -315,8 +316,11 @@ def analyse_symbol(
     symbol: str,
     timeframe: str = "1d",
     base_risk_pct: float = 1.0,
-) -> Optional[DFTESignal]:
-    """Run full KEPE + BMR + DFTE pipeline for one symbol."""
+) -> Optional[tuple]:
+    """
+    Run full KEPE + BMR + DFTE pipeline for one symbol.
+    Returns (DFTESignal, KEPEProfile) or None if BMR is unavailable.
+    """
     logger.info(f"Analysing {symbol}...")
 
     # 1. BMR — market field
@@ -346,7 +350,7 @@ def analyse_symbol(
             dfte_signal.all_gates_passed = False
         dfte_signal.rationale += f" | GOV: {gov_reason}"
 
-    return dfte_signal
+    return (dfte_signal, kepe)
 
 
 def run_basket(
@@ -355,19 +359,88 @@ def run_basket(
     base_risk_pct: float = 1.0,
     execute: bool = False,
     wallet_mode: str = "paper",
-) -> Dict[str, DFTESignal]:
+) -> tuple:
     """
     Analyse and optionally execute a basket of symbols.
-    Returns dict of symbol → DFTESignal.
+    Returns (signals, cmam_profile, trade_classifications) where:
+      signals              : Dict[str, DFTESignal]
+      cmam_profile         : CMAMProfile (or None if wallet unavailable)
+      trade_classifications: Dict[str, TradeClassification]
     """
     signals: Dict[str, DFTESignal] = {}
     portfolio: Dict[str, float] = {}
+    trade_classifications: Dict[str, TradeClassification] = {}
+
+    # ── CMAM initialisation ──────────────────────────────────────────────────
+    wallet      = get_wallet(wallet_mode)
+    fund_value  = wallet.get_cash()
+    cmam        = CMAMEngine()
+    short_used  = 0.0
+    cmam_profile = cmam.profile(fund_value, short_used=short_used)
+    logger.info(
+        f"CMAM: fund=${fund_value:,.0f} | SAR={cmam_profile.sar:.2f} | "
+        f"mode={cmam_profile.mode} | ST=${cmam_profile.st_budget:,.0f} "
+        f"LT=${cmam_profile.lt_budget:,.0f}"
+    )
 
     for symbol in symbols:
-        sig = analyse_symbol(symbol, timeframe, base_risk_pct)
-        if sig:
-            signals[symbol] = sig
-            portfolio[symbol] = sig.position_size_pct if sig.action == "BUY" else 0.0
+        result = analyse_symbol(symbol, timeframe, base_risk_pct)
+        if result is None:
+            continue
+        sig, kepe = result
+
+        # Mirror gate
+        mc = CMAMEngine.mirror_check(sig.rationale)
+        if not mc.passed:
+            logger.warning(
+                f"Mirror gate [{symbol}]: {mc.flag} — 24h hold logged, trade deferred"
+            )
+            sig.action = "HOLD"
+            sig.position_size_pct = 0.0
+            sig.rationale += f" | MIRROR: {mc.flag}"
+
+        # Cooling-off gate
+        if CMAMEngine.cooling_off_required(sig.rationale):
+            logger.warning(
+                f"Cooling-off [{symbol}]: entropy→syntropy conversion reasoning "
+                f"detected — 24h hold. Rationale: {sig.rationale}"
+            )
+            sig.action = "HOLD"
+            sig.position_size_pct = 0.0
+            sig.rationale += " | COOLING_OFF: 24h hold"
+
+        # Refresh CMAM profile with current short_used
+        cmam_profile = cmam.profile(fund_value, short_used=short_used)
+
+        # Trade classification
+        tc = cmam.classify_trade(sig, kepe)
+        trade_classifications[symbol] = tc
+
+        # Apply CMAM cap: override size and block if CMAM says BLOCKED
+        if tc.trade_type == "BLOCKED" and sig.action not in ("HOLD", "BLOCKED"):
+            logger.info(
+                f"CMAM blocked [{symbol}]: {tc.routing_note}"
+            )
+            sig.action = "BLOCKED"
+            sig.position_size_pct = 0.0
+            sig.rationale += f" | CMAM: {tc.routing_note}"
+        elif sig.action in ("BUY", "SELL"):
+            if sig.position_size_pct > tc.max_size_pct:
+                logger.info(
+                    f"CMAM size cap [{symbol}]: "
+                    f"{sig.position_size_pct:.2f}% → {tc.max_size_pct:.2f}% "
+                    f"({tc.budget_source})"
+                )
+                sig.position_size_pct = tc.max_size_pct
+            # Track short book usage
+            if sig.action == "SELL" and sig.position_size_pct > 0:
+                short_used += fund_value * (sig.position_size_pct / 100.0)
+
+        signals[symbol] = sig
+        portfolio[symbol] = sig.position_size_pct if sig.action == "BUY" else 0.0
+
+    # Final CMAM profile with all shorts tracked
+    cmam_profile = cmam.profile(fund_value, short_used=short_used)
 
     # Portfolio-level contradiction check
     if len(portfolio) > 1:
@@ -380,8 +453,7 @@ def run_basket(
 
     # Execute if requested
     if execute:
-        wallet = get_wallet(wallet_mode)
-        cash = wallet.get_cash()
+        cash = fund_value
         logger.info(f"Wallet: ${cash:,.2f} available ({wallet_mode})")
 
         for symbol, sig in signals.items():
@@ -415,12 +487,16 @@ def run_basket(
                 else:
                     logger.error(f"✗ Order failed for {symbol}: {result.error}")
 
-    return signals
+    return signals, cmam_profile, trade_classifications
 
 
 # ─── Terminal dashboard ───────────────────────────────────────────────────────
 
-def print_dashboard(signals: Dict[str, DFTESignal]):
+def print_dashboard(
+    signals: Dict[str, DFTESignal],
+    cmam_profile: Optional[CMAMProfile] = None,
+    trade_classifications: Optional[Dict[str, TradeClassification]] = None,
+):
     """Rich terminal dashboard of DFTE signals."""
     try:
         from rich.console import Console
@@ -519,6 +595,45 @@ def print_dashboard(signals: Dict[str, DFTESignal]):
                 border_style="yellow"
             ))
 
+        # CMAM profile panel
+        if cmam_profile is not None:
+            tc_map = trade_classifications or {}
+            mode_colour = {
+                "ST_MODE":    "cyan",
+                "TRANSITION": "yellow",
+                "MATURE":     "green",
+            }.get(cmam_profile.mode, "white")
+
+            cmam_lines = [
+                f"[bold]Fund:[/bold] ${cmam_profile.fund_value:>12,.0f}  "
+                f"[bold]Mode:[/bold] [{mode_colour}]{cmam_profile.mode}[/{mode_colour}]  "
+                f"[bold]SAR:[/bold] {cmam_profile.sar:.2f} / {cmam_profile.sar_max:.2f}",
+                f"[bold]ST budget:[/bold] ${cmam_profile.st_budget:>10,.0f}  "
+                f"[bold]LT budget:[/bold] ${cmam_profile.lt_budget:>10,.0f}",
+                f"[bold]Short used:[/bold] ${cmam_profile.short_used:>9,.0f}  "
+                f"[bold]Short remaining:[/bold] ${cmam_profile.short_remaining:>9,.0f}",
+            ]
+            if tc_map:
+                rows = []
+                for sym in sorted(tc_map):
+                    tc = tc_map[sym]
+                    type_col = {"ST": "cyan", "LT": "green", "BLOCKED": "red"}.get(
+                        tc.trade_type, "white"
+                    )
+                    rows.append(
+                        f"  {sym:<6} [{type_col}]{tc.trade_type}[/{type_col}]  "
+                        f"src={tc.budget_source:<10}  max={tc.max_size_pct:.2f}%  "
+                        f"{tc.routing_note[:60]}"
+                    )
+                cmam_lines.append("")
+                cmam_lines.extend(rows)
+
+            console.print(Panel(
+                "\n".join(cmam_lines),
+                title="[bold blue]CMAM — Capital Maturity Allocation[/bold blue]",
+                border_style="blue",
+            ))
+
         # Recent influence log
         influence = get_influence_summary(5)
         if influence:
@@ -593,25 +708,25 @@ def main():
 
     if args.watch:
         while True:
-            signals = run_basket(
+            signals, cmam_profile, trade_classifications = run_basket(
                 symbols=args.symbols,
                 timeframe=args.timeframe,
                 base_risk_pct=args.risk,
                 execute=args.execute,
                 wallet_mode=args.mode,
             )
-            print_dashboard(signals)
+            print_dashboard(signals, cmam_profile, trade_classifications)
             logger.info("Sleeping 5 minutes...")
             time.sleep(300)
     else:
-        signals = run_basket(
+        signals, cmam_profile, trade_classifications = run_basket(
             symbols=args.symbols,
             timeframe=args.timeframe,
             base_risk_pct=args.risk,
             execute=args.execute,
             wallet_mode=args.mode,
         )
-        print_dashboard(signals)
+        print_dashboard(signals, cmam_profile, trade_classifications)
 
 
 if __name__ == "__main__":
