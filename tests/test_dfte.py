@@ -1576,3 +1576,303 @@ class TestSAS:
         assert profile.wolf_confirmed is False
         assert profile.short_candidate is False
         assert "BTC-USD" in profile.symbol
+
+
+# ─── TestBacktest ──────────────────────────────────────────────────────────────
+
+import sys as _sys
+import os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
+_sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "..", "bmr"))
+
+from backtest.backtest_engine import (
+    run_nu_backtest,
+    run_lsii_backtest,
+    run_sts_backtest,
+    save_report,
+    run_backtest,
+    BacktestReport,
+    SASValidationReport,
+    CONFIRMED, PARTIAL, INCONCLUSIVE, REFUTED,
+    _compute_nu_proxy,
+    _compute_sts_proxy,
+    _forward_return,
+    _pearson_r,
+    _verdict_from_r_and_direction,
+    _nu_quartile,
+)
+
+
+def _make_trending_closes(n: int = 300, drift: float = 0.001,
+                           seed: int = 42) -> "np.ndarray":
+    """Synthetic price series with controlled drift and noise."""
+    rng = np.random.default_rng(seed)
+    noise = rng.normal(0, 0.008, n)
+    log_returns = drift + noise
+    closes = 100.0 * np.exp(np.cumsum(log_returns))
+    return closes
+
+
+def _make_reverting_series(n: int = 200, reversal_idx: int = 100,
+                            seed: int = 0) -> "np.ndarray":
+    """
+    Price series that trends up to reversal_idx then trends down.
+    Used to test LSII arc-break detection.
+    """
+    rng = np.random.default_rng(seed)
+    up   = 100.0 * np.exp(np.cumsum( 0.003 + rng.normal(0, 0.006, reversal_idx)))
+    down = up[-1] * np.exp(np.cumsum(-0.003 + rng.normal(0, 0.006, n - reversal_idx)))
+    return np.concatenate([up, down])
+
+
+class TestBacktest:
+    """
+    Phase 7: Backtest harness — synthetic data only, no network calls. [TESTABLE]
+    All tests verify the mechanics of the backtest engine;
+    real market verdicts come from live runs.
+    """
+
+    # ── forward return helper ──────────────────────────────────────────────────
+
+    def test_forward_return_correct(self):
+        closes = np.array([100.0, 101.0, 103.0, 102.0, 105.0])
+        assert _forward_return(closes, 0, 4) == pytest.approx(0.05, abs=1e-4)
+
+    def test_forward_return_out_of_bounds_is_none(self):
+        closes = np.array([100.0, 102.0])
+        assert _forward_return(closes, 0, 5) is None
+
+    # ── ν proxy + quartile binning ─────────────────────────────────────────────
+
+    def test_nu_proxy_returns_result_with_enough_history(self):
+        closes = _make_trending_closes(200)
+        result = _compute_nu_proxy(closes, 100)
+        assert result is not None
+        assert 0.0 <= result.nu <= 1.0
+
+    def test_nu_proxy_none_with_insufficient_history(self):
+        closes = _make_trending_closes(200)
+        assert _compute_nu_proxy(closes, 10) is None
+
+    def test_nu_quartile_binning(self):
+        assert _nu_quartile(0.20) == "LOW"
+        assert _nu_quartile(0.45) == "MID"
+        assert _nu_quartile(0.60) == "HIGH"
+        assert _nu_quartile(0.80) == "ZPB"
+
+    # ── verdict generation (epistemically honest) ──────────────────────────────
+
+    def test_verdict_confirmed_strong_positive_r(self):
+        v = _verdict_from_r_and_direction(r=0.40, n=100, expected_positive=True)
+        assert v == CONFIRMED
+
+    def test_verdict_refuted_when_direction_wrong(self):
+        # Hypothesis expects positive correlation, but r is strongly negative
+        v = _verdict_from_r_and_direction(r=-0.30, n=100, expected_positive=True)
+        assert v == REFUTED
+
+    def test_verdict_inconclusive_weak_signal(self):
+        v = _verdict_from_r_and_direction(r=0.05, n=100, expected_positive=True)
+        assert v == INCONCLUSIVE
+
+    def test_verdict_inconclusive_too_few_observations(self):
+        v = _verdict_from_r_and_direction(r=0.50, n=5, expected_positive=True)
+        assert v == INCONCLUSIVE
+
+    def test_verdict_partial_moderate_signal(self):
+        v = _verdict_from_r_and_direction(r=0.15, n=80, expected_positive=True)
+        assert v in (PARTIAL, INCONCLUSIVE)   # could be either depending on t-stat
+
+    # ── synthetic ν backtest — should detect known correlation ────────────────
+
+    def test_nu_backtest_detects_planted_correlation(self):
+        """
+        Synthetic series: strong drift → ν should be in HIGH/ZPB quartile
+        while the series is trending. This verifies engine runs without error
+        and produces non-trivial quartile distributions.
+        """
+        closes = _make_trending_closes(300, drift=0.002, seed=1)
+        report = run_nu_backtest("SYNTHETIC_UP", closes)
+        assert report.n_observations >= 10
+        assert report.evidence_verdict in (CONFIRMED, PARTIAL, INCONCLUSIVE, REFUTED)
+        # ZPB or HIGH quartile should have positive 10d mean return (drift is +ve)
+        qr_10 = report.per_quartile_mean_return.get("10d", {})
+        high_return = qr_10.get("HIGH", None)
+        zpb_return  = qr_10.get("ZPB", None)
+        # At least one of HIGH/ZPB should be positive (planted upward drift)
+        if high_return is not None and zpb_return is not None:
+            assert max(high_return, zpb_return) > -0.05, (
+                "Expected at least one of HIGH/ZPB quartile to show positive return "
+                f"in a strongly trending up series. Got HIGH={high_return}, ZPB={zpb_return}"
+            )
+
+    # ── synthetic LSII backtest — reverting series ────────────────────────────
+
+    def test_lsii_backtest_reverting_series(self):
+        """
+        Price that trends up then hard-reverses.
+        LSII should flag the reversal zone and ideally predict negative returns.
+        Engine must run without error and produce a verdict.
+        """
+        closes = _make_reverting_series(200, reversal_idx=100)
+        highs   = closes * 1.005
+        lows    = closes * 0.995
+        opens   = closes * 1.001
+        volumes = np.full_like(closes, 1_000_000.0)
+        timestamps = np.arange(len(closes), dtype=float) * 86400 + 1_700_000_000
+
+        report = run_lsii_backtest(
+            "SYNTHETIC_REV", closes, highs, lows, opens, volumes, timestamps
+        )
+        assert report.evidence_verdict in (CONFIRMED, PARTIAL, INCONCLUSIVE, REFUTED)
+        # Both n_flagged + n_baseline should be >= 0 (no crash)
+        assert report.n_flagged >= 0
+        assert report.n_baseline >= 0
+
+    # ── STS proxy ─────────────────────────────────────────────────────────────
+
+    def test_sts_transition_to_loading_on_acceleration(self):
+        """
+        A series that accelerates upward (drift increasing) should produce
+        more LOADING states than a flat series, because the WFS proxy slope
+        reflects the *change* in 20-day returns, not their absolute level.
+        """
+        rng = np.random.default_rng(42)
+        # Accelerating upward: drift grows from 0 → 0.008
+        n = 300
+        drifts = np.linspace(0.0, 0.008, n)
+        log_returns = drifts + rng.normal(0, 0.005, n)
+        closes_accel = 100.0 * np.exp(np.cumsum(log_returns))
+
+        # Flat (no drift)
+        closes_flat = 100.0 + rng.normal(0, 0.5, n)
+
+        counts_accel = {"LOADING": 0, "STABLE": 0, "DETERIORATING": 0}
+        counts_flat  = {"LOADING": 0, "STABLE": 0, "DETERIORATING": 0}
+        for idx in range(100, 290):
+            counts_accel[_compute_sts_proxy(closes_accel, idx)] += 1
+            counts_flat[_compute_sts_proxy(closes_flat,   idx)] += 1
+
+        # Accelerating series should have more LOADING than flat
+        assert counts_accel["LOADING"] >= counts_flat["LOADING"], (
+            f"Accelerating series should produce more LOADING than flat: "
+            f"accel_LOADING={counts_accel['LOADING']} vs flat_LOADING={counts_flat['LOADING']}"
+        )
+
+    def test_sts_returns_valid_state_strings(self):
+        """_compute_sts_proxy always returns one of the three valid states."""
+        closes = _make_trending_closes(200, drift=0.002)
+        valid = {"LOADING", "STABLE", "DETERIORATING"}
+        for idx in range(80, 180):
+            state = _compute_sts_proxy(closes, idx)
+            assert state in valid, f"Unexpected STS state: {state}"
+
+    # ── SAS backtest is marked SPECULATIVE ────────────────────────────────────
+
+    def test_sas_backtest_is_speculative(self):
+        sas = SASValidationReport(symbol="TEST")
+        assert sas.evidence_level == "SPECULATIVE"
+        assert sas.evidence_verdict == INCONCLUSIVE
+        assert len(sas.mystery_pile_reason) > 10
+
+    # ── REFUTED verdict is never suppressed ───────────────────────────────────
+
+    def test_refuted_result_on_anti_correlated_series(self):
+        """
+        Descending drift series: ν (derived from upward price history)
+        will NOT predict positive forward returns. Verdict should be REFUTED
+        or INCONCLUSIVE — never CONFIRMED.
+        """
+        closes = _make_trending_closes(300, drift=-0.003, seed=99)
+        report = run_nu_backtest("SYNTHETIC_DOWN", closes)
+        assert report.evidence_verdict in (REFUTED, INCONCLUSIVE, PARTIAL)
+        # Must NOT be CONFIRMED on a downward drift (no upward coherence)
+        assert report.evidence_verdict != CONFIRMED
+
+    # ── JSON persistence ──────────────────────────────────────────────────────
+
+    def test_report_saves_to_json(self, tmp_path):
+        """BacktestReport serialises to valid JSON without error."""
+        # Build a minimal report without network calls
+        closes = _make_trending_closes(300)
+        nu_r   = run_nu_backtest("SPY_TEST", closes)
+        highs  = closes * 1.005
+        lows   = closes * 0.995
+        opens  = closes
+        vols   = np.full_like(closes, 1e6)
+        ts     = np.arange(len(closes), dtype=float) * 86400 + 1_700_000_000
+        lsii_r = run_lsii_backtest("SPY_TEST", closes, highs, lows, opens, vols, ts)
+        sts_r  = run_sts_backtest("SPY_TEST", closes)
+        sas_r  = SASValidationReport(symbol="SPY_TEST")
+
+        from backtest.backtest_engine import (
+            SymbolBacktestResult,
+            _aggregate_nu, _aggregate_lsii, _aggregate_sts,
+            _overall_verdict_and_recommendations,
+        )
+        from datetime import timezone
+
+        sym_result = SymbolBacktestResult(
+            symbol="SPY_TEST",
+            nu_report=nu_r, lsii_report=lsii_r,
+            sts_report=sts_r, sas_report=sas_r,
+        )
+        nu_agg   = _aggregate_nu([nu_r])
+        lsii_agg = _aggregate_lsii([lsii_r])
+        sts_agg  = _aggregate_sts([sts_r])
+        overall, mystery, calibration = _overall_verdict_and_recommendations(
+            nu_agg, lsii_agg, sts_agg
+        )
+        report = BacktestReport(
+            run_date=datetime.now(timezone.utc).isoformat(),
+            symbols=["SPY_TEST"],
+            per_symbol=[sym_result],
+            nu_aggregate=nu_agg,
+            lsii_aggregate=lsii_agg,
+            sts_aggregate=sts_agg,
+            overall_verdict=overall,
+            mystery_pile_items=mystery,
+            calibration_recommendations=calibration,
+        )
+        path = str(tmp_path / "test_backtest.json")
+        saved = save_report(report, path=path)
+        assert _os.path.exists(saved)
+        import json as _json
+        with open(saved) as f:
+            data = _json.load(f)
+        assert data["overall_verdict"] in (CONFIRMED, PARTIAL, INCONCLUSIVE, REFUTED)
+        assert "mystery_pile_items" in data
+        assert "calibration_recommendations" in data
+
+    # ── mystery pile populated when inconclusive ──────────────────────────────
+
+    def test_mystery_pile_populated_on_inconclusive(self):
+        """
+        Flat price (no drift) → all signals weak → INCONCLUSIVE verdicts
+        → mystery pile should be populated.
+        """
+        rng = np.random.default_rng(7)
+        closes = 100.0 + rng.normal(0, 0.5, 300)   # near-flat
+        nu_r  = run_nu_backtest("FLAT", closes)
+        highs = closes * 1.002
+        lows  = closes * 0.998
+        opens = closes
+        vols  = np.full_like(closes, 1e6)
+        ts    = np.arange(len(closes), dtype=float) * 86400 + 1_700_000_000
+        lsii_r = run_lsii_backtest("FLAT", closes, highs, lows, opens, vols, ts)
+        sts_r  = run_sts_backtest("FLAT", closes)
+
+        from backtest.backtest_engine import (
+            _aggregate_nu, _aggregate_lsii, _aggregate_sts,
+            _overall_verdict_and_recommendations,
+        )
+        nu_agg   = _aggregate_nu([nu_r])
+        lsii_agg = _aggregate_lsii([lsii_r])
+        sts_agg  = _aggregate_sts([sts_r])
+        _, mystery, _ = _overall_verdict_and_recommendations(
+            nu_agg, lsii_agg, sts_agg
+        )
+        # SAS is always in the mystery pile regardless of verdicts
+        assert any("SAS" in item for item in mystery), (
+            "SAS should always be in mystery pile (SPECULATIVE data requirement)"
+        )

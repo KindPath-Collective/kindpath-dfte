@@ -1,0 +1,209 @@
+{
+  "run_date": "2026-03-01T09:20:25.775567+00:00",
+  "symbols": [
+    "SPY"
+  ],
+  "per_symbol": [
+    {
+      "symbol": "SPY",
+      "nu_report": {
+        "symbol": "SPY",
+        "n_observations": 382,
+        "per_quartile_mean_return": {
+          "5d": {
+            "LOW": 0.0,
+            "MID": 0.030252588437403728,
+            "HIGH": 0.00591879815131931,
+            "ZPB": 0.002453655628176454
+          },
+          "10d": {
+            "LOW": 0.0,
+            "MID": 0.0471306694044417,
+            "HIGH": 0.011650729329650394,
+            "ZPB": 0.00505977318324307
+          },
+          "20d": {
+            "LOW": 0.0,
+            "MID": 0.06716150442301487,
+            "HIGH": 0.02799015475044973,
+            "ZPB": 0.009171909040232544
+          },
+          "60d": {
+            "LOW": 0.0,
+            "MID": 0.13815227352724838,
+            "HIGH": 0.07505083476266415,
+            "ZPB": 0.031982115297279456
+          }
+        },
+        "correlation_nu_vs_return": {
+          "5d": -0.14309173915476575,
+          "10d": -0.12673214795052049,
+          "20d": -0.10283114019919624,
+          "60d": -0.3330271420844249
+        },
+        "correlation_nu_vs_magnitude": {
+          "5d": 0.029576164739809598,
+          "10d": -0.1657094907878967,
+          "20d": 0.11006873503313493,
+          "60d": 0.12012829305274267
+        },
+        "evidence_verdict": "REFUTED",
+        "evidence_level": "TESTABLE",
+        "notes": "n=382 observations. | 10d directional corr: r=-0.127 (INCONCLUSIVE) | 20d directional corr: r=-0.103 (INCONCLUSIVE) | 10d magnitude  corr:  r=-0.166 (REFUTED) | 20d magnitude  corr:  r=0.110 (PARTIAL) | REFUTED: \u03bd price-proxy shows negative or zero directional predictive value at tested horizons.",
+        "quartile_counts": {
+          "LOW": 0,
+          "MID": 7,
+          "HIGH": 78,
+          "ZPB": 297
+        }
+      },
+      "lsii_report": {
+        "symbol": "SPY",
+        "n_flagged": 21,
+        "n_baseline": 20,
+        "flagged_mean_return": {
+          "5d": 0.0064629531049119815,
+          "10d": 0.006623211786876781,
+          "20d": 0.016521030373873355,
+          "60d": 0.05053818308448046
+        },
+        "baseline_mean_return": {
+          "5d": 0.006600656477774404,
+          "10d": 0.009978266116379917,
+          "20d": 0.015151435430523889,
+          "60d": 0.03742394940814545
+        },
+        "flag_predictive_value": {
+          "5d": -0.00013770337286242267,
+          "10d": -0.0033550543295031363,
+          "20d": 0.0013695949433494663,
+          "60d": 0.013114233676335005
+        },
+        "optimal_threshold": "high",
+        "current_threshold_ok": true,
+        "evidence_verdict": "INCONCLUSIVE",
+        "evidence_level": "TESTABLE",
+        "notes": "No clear signal. Flagged 10d=0.0066, baseline=0.0100. Insufficient evidence to confirm or refute."
+      },
+      "sts_report": {
+        "symbol": "SPY",
+        "n_loading": 107,
+        "n_stable": 116,
+        "n_deteriorating": 139,
+        "loading_mean_return": {
+          "20d": 0.012202234343072335,
+          "60d": 0.046741922705370774
+        },
+        "stable_mean_return": {
+          "20d": 0.009277581386431585,
+          "60d": 0.03625874567668968
+        },
+        "deteriorating_mean_return": {
+          "20d": 0.017977122398884337,
+          "60d": 0.04499061766704303
+        },
+        "loading_vs_deteriorating": {
+          "20d": -0.0057748880558120014,
+          "60d": 0.0017513050383277454
+        },
+        "evidence_verdict": "INCONCLUSIVE",
+        "evidence_level": "TESTABLE",
+        "notes": "n=362 (loading=107, stable=116, deteriorating=139). | 20d: LOAD=0.0122 DETM=0.0180 spread=-0.0058 r=-0.067 (INCONCLUSIVE) | 60d: LOAD=0.0467 DETM=0.0450 spread=0.0018 r=0.006 (INCONCLUSIVE)"
+      },
+      "sas_report": {
+        "symbol": "SPY",
+        "evidence_verdict": "INCONCLUSIVE",
+        "evidence_level": "SPECULATIVE",
+        "notes": "SAS historical proxy unavailable \u2014 requires multi-year EDGAR NLP corpus. Backtest 4 intentionally sparse: [SPECULATIVE] per Phase 7 scope. Goes in mystery pile pending data sourcing.",
+        "mystery_pile_reason": "No reliable historical SAS proxy available"
+      }
+    }
+  ],
+  "nu_aggregate": {
+    "symbol": "AGGREGATE",
+    "n_observations": 382,
+    "per_quartile_mean_return": {},
+    "correlation_nu_vs_return": {
+      "5d": -0.14309173915476575,
+      "10d": -0.12673214795052049,
+      "20d": -0.10283114019919624,
+      "60d": -0.3330271420844249
+    },
+    "correlation_nu_vs_magnitude": {
+      "5d": 0.029576164739809598,
+      "10d": -0.1657094907878967,
+      "20d": 0.11006873503313493,
+      "60d": 0.12012829305274267
+    },
+    "evidence_verdict": "REFUTED",
+    "evidence_level": "TESTABLE",
+    "notes": "Aggregate across 1 symbols, n=382. Mean 10d corr=-0.127, 20d corr=-0.103. Per-symbol: SPY:REFUTED",
+    "quartile_counts": {}
+  },
+  "lsii_aggregate": {
+    "symbol": "AGGREGATE",
+    "n_flagged": 21,
+    "n_baseline": 20,
+    "flagged_mean_return": {
+      "5d": 0.0064629531049119815,
+      "10d": 0.006623211786876781,
+      "20d": 0.016521030373873355,
+      "60d": 0.05053818308448046
+    },
+    "baseline_mean_return": {
+      "5d": 0.006600656477774404,
+      "10d": 0.009978266116379917,
+      "20d": 0.015151435430523889,
+      "60d": 0.03742394940814545
+    },
+    "flag_predictive_value": {
+      "5d": -0.00013770337286242267,
+      "10d": -0.0033550543295031363,
+      "20d": 0.0013695949433494663,
+      "60d": 0.013114233676335005
+    },
+    "optimal_threshold": "high",
+    "current_threshold_ok": true,
+    "evidence_verdict": "INCONCLUSIVE",
+    "evidence_level": "TESTABLE",
+    "notes": "Aggregate across 1 symbols. n_flagged=21, n_baseline=20. 10d mean spread=-0.0034. Per-symbol: SPY:INCONCLUSIVE"
+  },
+  "sts_aggregate": {
+    "symbol": "AGGREGATE",
+    "n_loading": 107,
+    "n_stable": 116,
+    "n_deteriorating": 139,
+    "loading_mean_return": {
+      "20d": 0.012202234343072335,
+      "60d": 0.046741922705370774
+    },
+    "stable_mean_return": {
+      "20d": 0.009277581386431585,
+      "60d": 0.03625874567668968
+    },
+    "deteriorating_mean_return": {
+      "20d": 0.017977122398884337,
+      "60d": 0.04499061766704303
+    },
+    "loading_vs_deteriorating": {
+      "20d": -0.0057748880558120014,
+      "60d": 0.0017513050383277454
+    },
+    "evidence_verdict": "INCONCLUSIVE",
+    "evidence_level": "TESTABLE",
+    "notes": "Aggregate across 1 symbols. 20d spread (LOAD-DETM)=-0.0058, 60d spread=0.0018. Per-symbol: SPY:INCONCLUSIVE"
+  },
+  "overall_verdict": "REFUTED",
+  "mystery_pile_items": [
+    "\u03bd price-proxy: refuted at tested horizons. Full multi-source \u03bd (including World Bank, FRED, COT) may behave differently. Price-only proxy may not capture cross-scale coherence adequately.",
+    "LSII-Price: inconclusive. Flagged periods show weak or mixed signal. May require longer price series or different window sizes.",
+    "SAS historical proxy: [SPECULATIVE] \u2014 no reliable multi-year EDGAR NLP corpus. Backtest 4 cannot be honestly run without 3-5 years of annual report NLP data. Requires building a EDGAR corpus pipeline first."
+  ],
+  "calibration_recommendations": [
+    "\u03bd: Run live \u03bd (full signal) vs forward return separately. Price proxy is a lower bound \u2014 full signal test required before final verdict.",
+    "SAS: Build EDGAR 10-K NLP corpus pipeline (3-5 years per symbol) before attempting full SAS historical validation. Current proxy is too noisy."
+  ],
+  "price_period_days": 730,
+  "wts_period_days": 504,
+  "nu_proxy_note": "\u03bd computed from price-derived scale proxies only. Full live signal includes World Bank, FRED, COT, etc. Evidence level: TESTABLE for proxy, SPECULATIVE for full-signal claims."
+}
