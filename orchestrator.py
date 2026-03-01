@@ -44,9 +44,17 @@ from typing import List, Optional, Dict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kepe.indicators import (
-    EcologicalSignal, WorldBankSignal, GDELTSignal,
-    OptimismSignal, ConflictPressureSignal
+    # Structural
+    EcologicalSignal, WorldBankSignal, YieldCurveSignal,
+    # Medium
+    CleanEnergyFlowSignal, GridParitySignal,
+    CreditSpreadSignal, EquityBreadthSignal,
+    RealYieldSignal, CryptoRegulatorySignal,
+    # Surface
+    GDELTSignal, OptimismSignal, ConflictPressureSignal,
+    CryptoRiskAppetiteSignal,
 )
+from kepe.kpre_physical import KPRELayer
 from kepe.syntropy_engine import synthesise_kepe_profile, KEPEProfile
 from dfte.dfte_engine import (
     BMRSummary, KEPESummary, synthesise_dfte_signal, DFTESignal
@@ -66,71 +74,167 @@ logger = logging.getLogger("dfte.orchestrator")
 
 BMR_SERVER = os.environ.get("BMR_SERVER", "http://localhost:8001")
 
+# ─── Instrument classification + world-field routing ─────────────────────────
+
+_ASSET_CLASSES: Dict[str, List[str]] = {
+    "CLEAN_ENERGY": ["ICLN", "NEE", "ENPH", "FSLR", "BEP", "PLUG", "TSLA"],
+    "BROAD_EQUITY": ["SPY", "QQQ", "IWM", "VTI", "RSP", "DIA",
+                     "XLK", "XLF", "XLV", "XLE", "XLU"],
+    "COMMODITIES":  ["GLD", "GC=F", "IAU", "SLV", "SI=F", "GDX", "USO", "CL=F"],
+    "CRYPTO":       ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD"],
+}
+
+
+def _classify_asset(symbol: str) -> str:
+    s = symbol.upper()
+    for cls, tickers in _ASSET_CLASSES.items():
+        if s in tickers:
+            return cls
+    return "BROAD_EQUITY"
+
+
+def _get_indicators_for_symbol(symbol: str) -> list:
+    """
+    Return the instrument-specific indicator stack for this symbol.
+    Signals are drawn from three temporal layers:
+      STRUCTURAL (0.40) — background macro/social regime
+      MEDIUM     (0.35) — sector flow, credit, physical proxies
+      SURFACE    (0.25) — sentiment, volatility, narrative
+    """
+    cls = _classify_asset(symbol)
+
+    if cls == "CLEAN_ENERGY":
+        return [
+            # Structural
+            EcologicalSignal(),
+            WorldBankSignal(),
+            # Medium
+            CleanEnergyFlowSignal(),
+            GridParitySignal(),
+            # Surface
+            OptimismSignal(),
+            ConflictPressureSignal(),
+            GDELTSignal(),
+        ]
+
+    elif cls == "BROAD_EQUITY":
+        return [
+            # Structural
+            WorldBankSignal(),
+            YieldCurveSignal(),
+            # Medium
+            CreditSpreadSignal(),
+            EquityBreadthSignal(),
+            # Surface
+            OptimismSignal(),
+            ConflictPressureSignal(),
+            GDELTSignal(),
+        ]
+
+    elif cls == "COMMODITIES":
+        return [
+            # Structural
+            EcologicalSignal(),
+            WorldBankSignal(),
+            # Medium
+            RealYieldSignal(),
+            # Surface
+            ConflictPressureSignal(),
+            GDELTSignal(),
+        ]
+
+    elif cls == "CRYPTO":
+        return [
+            # Structural
+            WorldBankSignal(),
+            # Medium
+            CryptoRegulatorySignal(),
+            # Surface
+            OptimismSignal(),
+            CryptoRiskAppetiteSignal(),
+            ConflictPressureSignal(),
+        ]
+
+    # Default: broad equity stack
+    return [
+        WorldBankSignal(),
+        YieldCurveSignal(),
+        CreditSpreadSignal(),
+        OptimismSignal(),
+        ConflictPressureSignal(),
+        GDELTSignal(),
+    ]
+
 
 # ─── Data fetchers ────────────────────────────────────────────────────────────
 
 def fetch_bmr_signal(symbol: str, timeframe: str = "1d") -> Optional[BMRSummary]:
-    """Fetch Market Field Score from BMR server."""
-    try:
-        resp = requests.post(
-            f"{BMR_SERVER}/analyse",
-            json={
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "periods": 200,
-                "include_lsii": True,
-                "include_curvature": True,
-                "multi_timeframe": False,
-            },
-            timeout=30,
-        )
-        if resp.status_code != 200:
-            logger.warning(f"BMR server returned {resp.status_code} for {symbol}")
+    """Fetch Market Field Score from BMR server. 60s timeout, 2 retries, 5s backoff."""
+    last_exc: Exception = None
+    for attempt in range(3):
+        if attempt > 0:
+            time.sleep(5)
+        try:
+            resp = requests.post(
+                f"{BMR_SERVER}/analyse",
+                json={
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "periods": 200,
+                    "include_lsii": True,
+                    "include_curvature": True,
+                    "multi_timeframe": False,
+                },
+                timeout=60,
+            )
+            if resp.status_code != 200:
+                logger.warning(f"BMR server returned {resp.status_code} for {symbol}")
+                return None
+
+            data = resp.json()
+            lsii = data.get("lsii") or {}
+            curv = data.get("curvature") or {}
+
+            return BMRSummary(
+                symbol=symbol,
+                mfs=float(data.get("mfs", 0.5)),
+                mfs_label=data.get("mfs_label", "DRIFT"),
+                direction=float(data.get("direction", 0.0)),
+                nu=float(data.get("nu", {}).get("score", 0.5)),
+                field_state=data.get("nu", {}).get("field_state", "DRIFT"),
+                trade_tier=data.get("trade_tier", "NANO"),
+                lsii=lsii.get("score"),
+                lsii_flag=lsii.get("flag"),
+                k=curv.get("k"),
+                curvature_state=curv.get("state"),
+            )
+        except requests.exceptions.ConnectionError:
+            logger.warning(
+                f"Cannot reach BMR server at {BMR_SERVER}. "
+                "Start it with: cd kindpath-bmr && python bmr_server.py"
+            )
             return None
+        except Exception as e:
+            last_exc = e
+            logger.warning(f"BMR fetch attempt {attempt + 1}/3 failed for {symbol}: {e}")
 
-        data = resp.json()
-        lsii = data.get("lsii") or {}
-        curv = data.get("curvature") or {}
-
-        return BMRSummary(
-            symbol=symbol,
-            mfs=float(data.get("mfs", 0.5)),
-            mfs_label=data.get("mfs_label", "DRIFT"),
-            direction=float(data.get("direction", 0.0)),
-            nu=float(data.get("nu", {}).get("score", 0.5)),
-            field_state=data.get("nu", {}).get("field_state", "DRIFT"),
-            trade_tier=data.get("trade_tier", "NANO"),
-            lsii=lsii.get("score"),
-            lsii_flag=lsii.get("flag"),
-            k=curv.get("k"),
-            curvature_state=curv.get("state"),
-        )
-    except requests.exceptions.ConnectionError:
-        logger.warning(
-            f"Cannot reach BMR server at {BMR_SERVER}. "
-            "Start it with: cd kindpath-bmr && python bmr_server.py"
-        )
-        return None
-    except Exception as e:
-        logger.error(f"BMR fetch error for {symbol}: {e}")
-        return None
+    logger.error(f"BMR fetch error for {symbol} after 3 attempts: {last_exc}")
+    return None
 
 
 def fetch_kepe_signal(
     symbol: str,
     market_curvature_k: Optional[float] = None
 ) -> KEPEProfile:
-    """Fetch and synthesise World Field Score."""
+    """
+    Fetch and synthesise World Field Score for this specific instrument.
+    Signal stack is routed by asset class (CLEAN_ENERGY / BROAD_EQUITY /
+    COMMODITIES / CRYPTO) so each instrument gets a distinct WFS.
+    """
     signals = []
-
-    # Collect all world field indicators
-    indicators = [
-        EcologicalSignal(),
-        WorldBankSignal(),
-        GDELTSignal(),
-        OptimismSignal(),
-        ConflictPressureSignal(),
-    ]
+    indicators = _get_indicators_for_symbol(symbol)
+    asset_cls = _classify_asset(symbol)
+    logger.debug(f"KEPE routing {symbol} → {asset_cls} ({len(indicators)} indicators)")
 
     for ind in indicators:
         try:
@@ -139,6 +243,19 @@ def fetch_kepe_signal(
                 signals.append(sig)
         except Exception as e:
             logger.warning(f"Indicator {ind.__class__.__name__} failed: {e}")
+
+    # KPRE Physical Flow Layer — instrument-agnostic background generative field
+    try:
+        kpre_sig = KPRELayer().compute()
+        if kpre_sig.confidence > 0:
+            signals.append(kpre_sig)
+            logger.debug(
+                f"KPRE [{symbol}]: {kpre_sig.value:+.3f} "
+                f"(conf={kpre_sig.confidence:.2f}, "
+                f"{kpre_sig.raw.get('n_signals', '?')}/5 sub-signals)"
+            )
+    except Exception as e:
+        logger.warning(f"KPRELayer failed for {symbol}: {e}")
 
     return synthesise_kepe_profile(
         symbol=symbol,
@@ -159,6 +276,8 @@ def kepe_to_summary(kepe: KEPEProfile) -> KEPESummary:
         equity_weight=kepe.equity_weight,
         is_syntropic=kepe.is_syntropic_asset,
         is_extractive=kepe.is_extractive_asset,
+        sts=kepe.sts,
+        sts_position=kepe.sts_position,
     )
 
 
@@ -300,8 +419,9 @@ def print_dashboard(signals: Dict[str, DFTESignal]):
         table.add_column("ν",         width=6)
         table.add_column("Conv.",     width=6)
         table.add_column("Size%",     width=6)
-        table.add_column("Gates",     width=12)
-        table.add_column("State",     width=12)
+        table.add_column("Gates",     width=6)
+        table.add_column("STS",       width=8)
+        table.add_column("Position",  width=14)
 
         for symbol, sig in sorted(signals.items()):
             action_colour = {
@@ -325,6 +445,23 @@ def print_dashboard(signals: Dict[str, DFTESignal]):
                 f"{'✓' if sig.governance_gate else '✗'}"
             )
 
+            sts       = getattr(sig, "sts", "STABLE")
+            sts_pos   = getattr(sig, "sts_position", "-")
+            sts_colour = {
+                "LOADING":       "green",
+                "DETERIORATING": "red",
+                "STABLE":        "dim",
+            }.get(sts, "white")
+            pos_colour = {
+                "ZPB_LOADING":  "bold green",
+                "COMPRESSION":  "cyan",
+                "REVIEW":       "yellow",
+                "EMERGING":     "green",
+                "FADING":       "red",
+                "RANGE":        "dim",
+                "BLOCKED":      "red",
+            }.get(sts_pos, "white")
+
             table.add_row(
                 f"[bold]{symbol}[/bold]",
                 f"[{action_colour}]{sig.action}[/{action_colour}]",
@@ -335,7 +472,8 @@ def print_dashboard(signals: Dict[str, DFTESignal]):
                 f"{sig.conviction:.2f}",
                 f"{sig.position_size_pct:.2f}",
                 gates,
-                sig.field_state if hasattr(sig, 'field_state') else "-",
+                f"[{sts_colour}]{sts}[/{sts_colour}]",
+                f"[{pos_colour}]{sts_pos}[/{pos_colour}]",
             )
 
         console.print(table)

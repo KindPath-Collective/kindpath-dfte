@@ -27,6 +27,7 @@ from kepe.syntropy_engine import (
     compute_interference_load, compute_opc,
     WFS_THRESHOLDS
 )
+from kepe.kpre_physical import KPRELayer
 from dfte.dfte_engine import (
     BMRSummary, KEPESummary, synthesise_dfte_signal,
     mfs_gate, wfs_gate, determine_tier,
@@ -469,3 +470,176 @@ class TestIntegration:
             result = wallet.submit_order(order)
             assert result.success, f"Paper order should succeed: {result.error}"
             assert wallet.get_cash() < 10_000.0
+
+
+# ─── KPRE Physical Flow Layer Tests ──────────────────────────────────────────
+
+class TestKPRE:
+    """
+    Tests for KPRELayer aggregation logic using synthetic data only.
+    No network calls — _aggregate() is called directly.
+    """
+
+    def _kpre_sig(self, value: float, confidence: float = 0.60,
+                  evidence: str = "TESTABLE") -> WorldSignal:
+        """Synthetic KPRE sub-signal for aggregation tests."""
+        return WorldSignal(
+            domain="KPRE_FLOW", source="test_kpre_sub",
+            region="GLOBAL", value=value, confidence=confidence,
+            evidence_level=evidence, timestamp=datetime.utcnow(),
+            temporal_layer="MEDIUM",
+        )
+
+    # ── Structural / domain correctness ─────────────────────────────────────
+
+    def test_empty_aggregate_zero_confidence(self):
+        """Empty input → zero confidence, system should not crash."""
+        result = KPRELayer._aggregate([])
+        assert result.confidence == 0.0
+
+    def test_empty_aggregate_zero_value(self):
+        """Empty input → zero value."""
+        result = KPRELayer._aggregate([])
+        assert result.value == 0.0
+
+    def test_empty_aggregate_domain_is_kpre(self):
+        """Empty input → domain is still KPRE."""
+        result = KPRELayer._aggregate([])
+        assert result.domain == "KPRE"
+
+    def test_domain_is_kpre(self):
+        """Non-empty aggregate → domain must be KPRE."""
+        result = KPRELayer._aggregate([self._kpre_sig(0.5)])
+        assert result.domain == "KPRE"
+
+    def test_temporal_layer_is_medium(self):
+        """KPRE composite temporal layer is always MEDIUM."""
+        result = KPRELayer._aggregate([self._kpre_sig(0.4)])
+        assert result.temporal_layer == "MEDIUM"
+
+    # ── Value direction ──────────────────────────────────────────────────────
+
+    def test_positive_signals_positive_composite(self):
+        """All positive sub-signals → positive composite value."""
+        sigs = [self._kpre_sig(0.6), self._kpre_sig(0.7), self._kpre_sig(0.5)]
+        result = KPRELayer._aggregate(sigs)
+        assert result.value > 0, \
+            f"Positive sub-signals → composite > 0, got {result.value:.3f}"
+
+    def test_negative_signals_negative_composite(self):
+        """All negative sub-signals → negative composite value."""
+        sigs = [self._kpre_sig(-0.6), self._kpre_sig(-0.7), self._kpre_sig(-0.5)]
+        result = KPRELayer._aggregate(sigs)
+        assert result.value < 0, \
+            f"Negative sub-signals → composite < 0, got {result.value:.3f}"
+
+    def test_value_in_bounds(self):
+        """Composite value must be within [-1, 1] even at extremes."""
+        sigs = [self._kpre_sig(1.0), self._kpre_sig(0.9), self._kpre_sig(1.0)]
+        result = KPRELayer._aggregate(sigs)
+        assert -1.0 <= result.value <= 1.0, \
+            f"KPRE value out of bounds: {result.value:.3f}"
+
+    def test_mixed_signals_confidence_weighted(self):
+        """High-confidence positive + low-confidence negative → net positive."""
+        sigs = [
+            self._kpre_sig(0.7, confidence=0.80),   # strong positive
+            self._kpre_sig(-0.5, confidence=0.20),  # weak negative
+        ]
+        result = KPRELayer._aggregate(sigs)
+        assert result.value > 0, \
+            f"High-conf positive should dominate: got {result.value:.3f}"
+
+    # ── Confidence scaling ───────────────────────────────────────────────────
+
+    def test_confidence_capped_at_070(self):
+        """Composite confidence is always ≤ 0.70 (TESTABLE ceiling)."""
+        sigs = [self._kpre_sig(0.5, confidence=0.95) for _ in range(5)]
+        result = KPRELayer._aggregate(sigs)
+        assert result.confidence <= 0.70, \
+            f"Confidence should be capped at 0.70, got {result.confidence:.3f}"
+
+    def test_partial_signals_lower_confidence(self):
+        """Fewer sub-signals → lower completeness → lower confidence."""
+        sigs_5 = [self._kpre_sig(0.5, confidence=0.60) for _ in range(5)]
+        sigs_2 = [self._kpre_sig(0.5, confidence=0.60) for _ in range(2)]
+        r5 = KPRELayer._aggregate(sigs_5)
+        r2 = KPRELayer._aggregate(sigs_2)
+        assert r2.confidence < r5.confidence, \
+            f"2/5 signals should have lower confidence than 5/5: {r2.confidence:.3f} vs {r5.confidence:.3f}"
+
+    # ── Evidence level propagation ───────────────────────────────────────────
+
+    def test_established_sub_signals_yield_testable(self):
+        """Composite is at most TESTABLE even if all sub-signals are ESTABLISHED."""
+        sigs = [self._kpre_sig(0.5, evidence="ESTABLISHED")]
+        result = KPRELayer._aggregate(sigs)
+        assert result.evidence_level in ("TESTABLE", "SPECULATIVE"), \
+            f"KPRE composite should not be ESTABLISHED, got {result.evidence_level}"
+
+    def test_speculative_evidence_propagates(self):
+        """If any sub-signal is SPECULATIVE, composite must be SPECULATIVE."""
+        sigs = [
+            self._kpre_sig(0.5, evidence="TESTABLE"),
+            self._kpre_sig(0.4, evidence="SPECULATIVE"),
+        ]
+        result = KPRELayer._aggregate(sigs)
+        assert result.evidence_level == "SPECULATIVE", \
+            f"SPECULATIVE sub-signal should propagate to composite, got {result.evidence_level}"
+
+    # ── Raw metadata ─────────────────────────────────────────────────────────
+
+    def test_raw_contains_n_signals(self):
+        """Raw metadata must report number of sub-signals used."""
+        sigs = [self._kpre_sig(0.4), self._kpre_sig(0.5)]
+        result = KPRELayer._aggregate(sigs)
+        assert result.raw is not None
+        assert result.raw.get("n_signals") == 2, \
+            f"raw.n_signals should be 2, got {result.raw.get('n_signals')}"
+
+    def test_raw_completeness_fraction(self):
+        """raw.completeness = n_signals / 5."""
+        sigs = [self._kpre_sig(0.5) for _ in range(3)]
+        result = KPRELayer._aggregate(sigs)
+        assert result.raw.get("completeness") == pytest.approx(0.6), \
+            f"3/5 completeness should be 0.6, got {result.raw.get('completeness')}"
+
+    # ── WFS integration ──────────────────────────────────────────────────────
+
+    def test_positive_kpre_shifts_wfs_up(self):
+        """Adding a strongly positive KPRE signal to KEPEProfile should raise WFS."""
+        base = [_world_sig("SOCIAL", 0.5), _world_sig("ECOLOGICAL", 0.4)]
+
+        profile_base = synthesise_kepe_profile("TEST", base)
+
+        kpre_positive = WorldSignal(
+            domain="KPRE", source="test_kpre_composite",
+            region="GLOBAL", value=0.90, confidence=0.65,
+            evidence_level="TESTABLE", timestamp=datetime.utcnow(),
+            temporal_layer="MEDIUM",
+        )
+        profile_kpre = synthesise_kepe_profile("TEST", base + [kpre_positive])
+
+        assert profile_kpre.wfs >= profile_base.wfs, (
+            f"Positive KPRE should raise WFS: "
+            f"{profile_base.wfs:.3f} → {profile_kpre.wfs:.3f}"
+        )
+
+    def test_negative_kpre_shifts_wfs_down(self):
+        """Adding a strongly negative KPRE signal to KEPEProfile should lower WFS."""
+        base = [_world_sig("SOCIAL", 0.5), _world_sig("ECOLOGICAL", 0.4)]
+
+        profile_base = synthesise_kepe_profile("TEST", base)
+
+        kpre_negative = WorldSignal(
+            domain="KPRE", source="test_kpre_composite",
+            region="GLOBAL", value=-0.90, confidence=0.65,
+            evidence_level="TESTABLE", timestamp=datetime.utcnow(),
+            temporal_layer="MEDIUM",
+        )
+        profile_kpre = synthesise_kepe_profile("TEST", base + [kpre_negative])
+
+        assert profile_kpre.wfs <= profile_base.wfs, (
+            f"Negative KPRE should lower WFS: "
+            f"{profile_base.wfs:.3f} → {profile_kpre.wfs:.3f}"
+        )

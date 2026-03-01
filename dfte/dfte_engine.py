@@ -63,6 +63,8 @@ class KEPESummary:
     equity_weight: float
     is_syntropic: bool
     is_extractive: bool
+    sts: str = "STABLE"
+    sts_position: str = "RANGE"
 
 
 @dataclass
@@ -96,8 +98,12 @@ class DFTESignal:
     governance_gate: bool
     all_gates_passed: bool
 
+    # STS
+    sts: str = "STABLE"
+    sts_position: str = "RANGE"
+
     # Rationale
-    rationale: str
+    rationale: str = ""
     warnings: List[str] = field(default_factory=list)
     evidence_level: str = "TESTABLE"
 
@@ -317,6 +323,8 @@ def synthesise_dfte_signal(
         wfs_gate=wfs_pass,
         governance_gate=governance_pass,
         all_gates_passed=all_gates,
+        sts=kepe.sts,
+        sts_position=kepe.sts_position,
         rationale=rationale,
         warnings=warnings,
         evidence_level="TESTABLE",
