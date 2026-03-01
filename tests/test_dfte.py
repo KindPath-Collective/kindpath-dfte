@@ -28,6 +28,12 @@ from kepe.syntropy_engine import (
     WFS_THRESHOLDS
 )
 from kepe.kpre_physical import KPRELayer
+from kepe.kpre_capital import (
+    KPRECapitalLayer,
+    InsiderTransactionSignal,
+    CongressionalTradingSignal,
+    CapexIntentSignal,
+)
 from dfte.dfte_engine import (
     BMRSummary, KEPESummary, synthesise_dfte_signal,
     mfs_gate, wfs_gate, determine_tier,
@@ -642,4 +648,264 @@ class TestKPRE:
         assert profile_kpre.wfs <= profile_base.wfs, (
             f"Negative KPRE should lower WFS: "
             f"{profile_base.wfs:.3f} → {profile_kpre.wfs:.3f}"
+        )
+
+
+# ─── KPRE Capital Formation Tests ─────────────────────────────────────────────
+
+class TestKPRECapital:
+    """
+    Tests for KPRECapitalLayer and sub-signal scoring logic.
+    No network calls — all scoring methods are tested directly with synthetic data.
+    """
+
+    # ── Helpers ─────────────────────────────────────────────────────────────
+
+    def _tx(self, code: str, shares: float = 5000, price: float = 100.0,
+            title: str = "officer", is_dir: bool = False,
+            is_10b5: bool = False, post: float = 50_000) -> dict:
+        """Synthetic Form 4 transaction record."""
+        return {
+            "code":          code,
+            "shares":        shares,
+            "price":         price,
+            "total_value":   shares * price,
+            "post_shares":   post,
+            "is_director":   is_dir,
+            "is_officer":    True,
+            "is_10pct":      False,
+            "officer_title": title,
+            "is_10b5_1":     is_10b5,
+            "date":          "2026-02-25",
+        }
+
+    def _congress_trade(self, tx_type: str, amount: str = "$1,001 - $15,000",
+                        chamber: str = "house") -> dict:
+        """Synthetic congressional trade record."""
+        return {
+            "type":             tx_type,
+            "amount":          amount,
+            "_chamber":        chamber,
+            "ticker":          "TEST",
+            "transaction_date": "2026-02-20",
+        }
+
+    # ── Insider transaction scoring ──────────────────────────────────────────
+
+    def test_cluster_buy_positive(self):
+        """3+ insiders purchasing → positive signal with cluster bonus."""
+        txs = [self._tx("P") for _ in range(3)]
+        value, raw = InsiderTransactionSignal._score_transactions(txs)
+        assert value > 0, f"Cluster buy should be positive, got {value:.3f}"
+        assert raw["cluster"] is True
+
+    def test_single_buy_positive(self):
+        """Single purchase → positive signal (no cluster)."""
+        txs = [self._tx("P")]
+        value, raw = InsiderTransactionSignal._score_transactions(txs)
+        assert value > 0
+        assert raw["cluster"] is False
+
+    def test_mass_sale_negative(self):
+        """Multiple insider sales → negative signal."""
+        txs = [self._tx("S") for _ in range(4)]
+        value, raw = InsiderTransactionSignal._score_transactions(txs)
+        assert value < 0, f"Mass sales should be negative, got {value:.3f}"
+        assert raw["n_sales"] == 4
+
+    def test_ceo_purchase_higher_weight(self):
+        """CEO purchase should outweigh equal-size generic officer purchase."""
+        ceo_tx  = [self._tx("P", title="chief executive officer")]
+        off_tx  = [self._tx("P", title="vp product")]
+        v_ceo, _ = InsiderTransactionSignal._score_transactions(ceo_tx)
+        v_off, _ = InsiderTransactionSignal._score_transactions(off_tx)
+        assert v_ceo >= v_off, \
+            f"CEO buy weight should be ≥ officer: {v_ceo:.3f} vs {v_off:.3f}"
+
+    def test_10b5_plan_discounted(self):
+        """10b5-1 pre-planned sales are discounted vs open-market sales."""
+        planned_sales   = [self._tx("S", is_10b5=True)  for _ in range(3)]
+        openmarket_sale = [self._tx("S", is_10b5=False) for _ in range(3)]
+        v_planned, _  = InsiderTransactionSignal._score_transactions(planned_sales)
+        v_open, _     = InsiderTransactionSignal._score_transactions(openmarket_sale)
+        # Planned is less negative (discounted) than open-market
+        assert v_planned > v_open, \
+            f"10b5-1 sales should be less negative: planned={v_planned:.3f}, open={v_open:.3f}"
+
+    def test_director_higher_weight_than_officer(self):
+        """Director purchases should carry more weight than generic officer."""
+        dir_tx = [self._tx("P", is_dir=True,  title="director")]
+        off_tx = [self._tx("P", is_dir=False, title="vp marketing")]
+        v_dir, _ = InsiderTransactionSignal._score_transactions(dir_tx)
+        v_off, _ = InsiderTransactionSignal._score_transactions(off_tx)
+        assert v_dir >= v_off, \
+            f"Director buy should be ≥ officer: {v_dir:.3f} vs {v_off:.3f}"
+
+    def test_awards_excluded(self):
+        """Award (A code) transactions should not count as bullish purchases."""
+        awards = [self._tx("A") for _ in range(5)]
+        value, raw = InsiderTransactionSignal._score_transactions(awards)
+        assert raw["n_purchases"] == 0, \
+            "Award grants should not be counted as purchases"
+
+    def test_empty_insider_transactions(self):
+        """Empty transactions list should return zero with clean raw dict."""
+        value, raw = InsiderTransactionSignal._score_transactions([])
+        assert value == 0.0
+        assert raw == {}
+
+    def test_mixed_buys_sells_direction(self):
+        """More buys than sells (by value) → net positive."""
+        txs = (
+            [self._tx("P", shares=10_000, price=150)] * 3 +  # large buys
+            [self._tx("S", shares=1_000,  price=150)] * 1    # small sale
+        )
+        value, _ = InsiderTransactionSignal._score_transactions(txs)
+        assert value > 0, f"More/larger buys should dominate: {value:.3f}"
+
+    # ── Congressional trading scoring ────────────────────────────────────────
+
+    def test_congressional_buy_positive(self):
+        """Congressional purchase → positive signal."""
+        trades = [self._congress_trade("purchase")]
+        value, raw = CongressionalTradingSignal._score_trades(trades, "TEST")
+        assert value > 0
+        assert raw["n_buys"] == 1
+
+    def test_congressional_sell_negative(self):
+        """Congressional sale → negative signal."""
+        trades = [self._congress_trade("sale_full")]
+        value, raw = CongressionalTradingSignal._score_trades(trades, "TEST")
+        assert value < 0
+        assert raw["n_sells"] == 1
+
+    def test_large_congressional_trade_higher_weight(self):
+        """Larger notional congressional trade should produce stronger signal."""
+        small = [self._congress_trade("purchase", "$1,001 - $15,000")]
+        large = [self._congress_trade("purchase", "Over $1,000,000")]
+        v_small, _ = CongressionalTradingSignal._score_trades(small, "TEST")
+        v_large, _ = CongressionalTradingSignal._score_trades(large, "TEST")
+        assert v_large >= v_small, \
+            f"Large trade should be ≥ small: {v_large:.3f} vs {v_small:.3f}"
+
+    def test_senate_trade_higher_weight_than_house(self):
+        """Senate trades should carry 1.2× weight vs House."""
+        house_trade  = [self._congress_trade("purchase", "$100,001 - $250,000", "house")]
+        senate_trade = [self._congress_trade("purchase", "$100,001 - $250,000", "senate")]
+        v_house, _  = CongressionalTradingSignal._score_trades(house_trade,  "TEST")
+        v_senate, _ = CongressionalTradingSignal._score_trades(senate_trade, "TEST")
+        assert v_senate >= v_house, \
+            f"Senate buy should be ≥ House: {v_senate:.3f} vs {v_house:.3f}"
+
+    def test_empty_congressional_trades(self):
+        """Empty trades → zero."""
+        value, raw = CongressionalTradingSignal._score_trades([], "TEST")
+        assert value == 0.0
+
+    # ── Capex trend scoring ──────────────────────────────────────────────────
+
+    def test_rising_capex_positive(self):
+        """Consistent capex growth → positive signal."""
+        quarters = [100.0, 110.0, 120.0, 130.0, 140.0, 150.0]
+        value, raw = CapexIntentSignal._compute_capex_trend(quarters)
+        assert value > 0, f"Rising capex should be positive, got {value:.3f}"
+
+    def test_falling_capex_negative(self):
+        """Consistent capex decline → negative signal."""
+        quarters = [150.0, 140.0, 130.0, 120.0, 110.0, 100.0]
+        value, raw = CapexIntentSignal._compute_capex_trend(quarters)
+        assert value < 0, f"Falling capex should be negative, got {value:.3f}"
+
+    def test_capex_value_in_bounds(self):
+        """Capex trend signal must be within [-1, 1]."""
+        quarters = [100.0, 300.0, 900.0, 2700.0]  # extreme 3× growth
+        value, raw = CapexIntentSignal._compute_capex_trend(quarters)
+        assert -1.0 <= value <= 1.0
+
+    def test_capex_raw_contains_pct_delta(self):
+        """Raw output should include delta percentage."""
+        quarters = [200.0, 220.0, 240.0, 260.0]
+        _, raw = CapexIntentSignal._compute_capex_trend(quarters)
+        assert "delta_full_pct" in raw
+        assert raw["delta_full_pct"] > 0
+
+    def test_single_quarter_insufficient(self):
+        """Single quarter → zero (no trend)."""
+        value, raw = CapexIntentSignal._compute_capex_trend([100.0])
+        assert value == 0.0
+
+    # ── KPRECapitalLayer aggregation ─────────────────────────────────────────
+
+    def _cap_sig(self, value: float, confidence: float = 0.60,
+                 evidence: str = "TESTABLE") -> WorldSignal:
+        return WorldSignal(
+            domain="KPRE_CAPITAL", source="test_capital_sub",
+            region="US", value=value, confidence=confidence,
+            evidence_level=evidence, timestamp=datetime.utcnow(),
+            temporal_layer="MEDIUM",
+        )
+
+    def test_empty_capital_aggregate_zero(self):
+        """Empty → zero confidence and value."""
+        result = KPRECapitalLayer._aggregate([])
+        assert result.confidence == 0.0
+        assert result.value == 0.0
+        assert result.domain == "KPRE_CAPITAL"
+
+    def test_capital_confidence_capped_at_065(self):
+        """KPRE_CAPITAL composite confidence ≤ 0.65."""
+        sigs = [self._cap_sig(0.5, confidence=0.90) for _ in range(3)]
+        result = KPRECapitalLayer._aggregate(sigs)
+        assert result.confidence <= 0.65, \
+            f"Capital confidence should cap at 0.65, got {result.confidence:.3f}"
+
+    def test_capital_positive_signals(self):
+        """All positive capital signals → positive composite."""
+        sigs = [self._cap_sig(0.7), self._cap_sig(0.6), self._cap_sig(0.8)]
+        result = KPRECapitalLayer._aggregate(sigs)
+        assert result.value > 0
+
+    def test_capital_negative_signals(self):
+        """All negative capital signals → negative composite."""
+        sigs = [self._cap_sig(-0.7), self._cap_sig(-0.6)]
+        result = KPRECapitalLayer._aggregate(sigs)
+        assert result.value < 0
+
+    def test_capital_established_evidence_preserved(self):
+        """All ESTABLISHED sub-signals → composite is ESTABLISHED."""
+        sigs = [self._cap_sig(0.5, evidence="ESTABLISHED")]
+        result = KPRECapitalLayer._aggregate(sigs)
+        assert result.evidence_level == "ESTABLISHED"
+
+    def test_capital_testable_propagates(self):
+        """TESTABLE sub-signal degrades ESTABLISHED composite."""
+        sigs = [
+            self._cap_sig(0.5, evidence="ESTABLISHED"),
+            self._cap_sig(0.4, evidence="TESTABLE"),
+        ]
+        result = KPRECapitalLayer._aggregate(sigs)
+        assert result.evidence_level == "TESTABLE"
+
+    def test_capital_raw_completeness(self):
+        """raw.completeness = n_signals / 3."""
+        sigs = [self._cap_sig(0.5)]
+        result = KPRECapitalLayer._aggregate(sigs)
+        assert result.raw.get("completeness") == pytest.approx(1 / 3, abs=0.01)
+
+    def test_capital_shifts_wfs_up(self):
+        """Adding positive KPRE_CAPITAL signal to KEPEProfile should raise WFS."""
+        base = [_world_sig("SOCIAL", 0.5), _world_sig("ECOLOGICAL", 0.4)]
+        profile_base = synthesise_kepe_profile("TEST", base)
+
+        cap_positive = WorldSignal(
+            domain="KPRE_CAPITAL", source="test_cap_composite",
+            region="US", value=0.85, confidence=0.60,
+            evidence_level="ESTABLISHED", timestamp=datetime.utcnow(),
+            temporal_layer="MEDIUM",
+        )
+        profile_cap = synthesise_kepe_profile("TEST", base + [cap_positive])
+
+        assert profile_cap.wfs >= profile_base.wfs, (
+            f"Positive KPRE_CAPITAL should raise WFS: "
+            f"{profile_base.wfs:.3f} → {profile_cap.wfs:.3f}"
         )

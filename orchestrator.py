@@ -55,6 +55,7 @@ from kepe.indicators import (
     CryptoRiskAppetiteSignal,
 )
 from kepe.kpre_physical import KPRELayer
+from kepe.kpre_capital import KPRECapitalLayer
 from kepe.syntropy_engine import synthesise_kepe_profile, KEPEProfile
 from dfte.dfte_engine import (
     BMRSummary, KEPESummary, synthesise_dfte_signal, DFTESignal
@@ -256,6 +257,19 @@ def fetch_kepe_signal(
             )
     except Exception as e:
         logger.warning(f"KPRELayer failed for {symbol}: {e}")
+
+    # KPRE Capital Formation Layer — symbol-specific insider/congress/capex intent
+    try:
+        cap_sig = KPRECapitalLayer().compute(symbol)
+        if cap_sig.confidence > 0:
+            signals.append(cap_sig)
+            logger.debug(
+                f"KPRE_CAPITAL [{symbol}]: {cap_sig.value:+.3f} "
+                f"(conf={cap_sig.confidence:.2f}, "
+                f"{cap_sig.raw.get('n_signals', '?')}/3 sub-signals)"
+            )
+    except Exception as e:
+        logger.warning(f"KPRECapitalLayer failed for {symbol}: {e}")
 
     return synthesise_kepe_profile(
         symbol=symbol,

@@ -47,6 +47,9 @@ DOMAIN_WEIGHTS: Dict[str, float] = {
     "SECTOR_FLOW":   0.25,  # instrument-specific sector capital flows
     "RISK_APPETITE": 0.22,  # risk-on/off (primarily for crypto)
     "KPRE":          0.35,  # physical flow — real-economy generative field
+    "KPRE_CAPITAL":  0.20,  # capital formation — insider/congress/capex intent
+    "KPRE_FLOW":     0.30,  # physical flow sub-signals (also counted under KPRE)
+    "KPRE_ENERGY":   0.28,  # energy grid sub-signals
 }
 
 # Temporal layer weights
