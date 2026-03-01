@@ -56,6 +56,7 @@ from kepe.indicators import (
 )
 from kepe.kpre_physical import KPRELayer
 from kepe.kpre_capital import KPRECapitalLayer
+from kepe.kpre_language import KPRELanguageLayer
 from kepe.syntropy_engine import synthesise_kepe_profile, KEPEProfile
 from dfte.dfte_engine import (
     BMRSummary, KEPESummary, synthesise_dfte_signal, DFTESignal
@@ -270,6 +271,19 @@ def fetch_kepe_signal(
             )
     except Exception as e:
         logger.warning(f"KPRECapitalLayer failed for {symbol}: {e}")
+
+    # KPRE Language Field Layer — Fed NLP, 10-K risk drift, earnings language
+    try:
+        lang_sig = KPRELanguageLayer().compute(symbol)
+        if lang_sig.confidence > 0:
+            signals.append(lang_sig)
+            logger.debug(
+                f"KPRE_LANGUAGE [{symbol}]: {lang_sig.value:+.3f} "
+                f"(conf={lang_sig.confidence:.2f}, "
+                f"{lang_sig.raw.get('n_signals', '?')}/3 sub-signals)"
+            )
+    except Exception as e:
+        logger.warning(f"KPRELanguageLayer failed for {symbol}: {e}")
 
     return synthesise_kepe_profile(
         symbol=symbol,

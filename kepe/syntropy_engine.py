@@ -50,6 +50,7 @@ DOMAIN_WEIGHTS: Dict[str, float] = {
     "KPRE_CAPITAL":  0.20,  # capital formation — insider/congress/capex intent
     "KPRE_FLOW":     0.30,  # physical flow sub-signals (also counted under KPRE)
     "KPRE_ENERGY":   0.28,  # energy grid sub-signals
+    "LANGUAGE":      0.15,  # language field — Fed NLP, 10-K risk drift, earnings
 }
 
 # Temporal layer weights

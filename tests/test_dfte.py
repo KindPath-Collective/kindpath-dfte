@@ -28,6 +28,12 @@ from kepe.syntropy_engine import (
     WFS_THRESHOLDS
 )
 from kepe.kpre_physical import KPRELayer
+from kepe.kpre_language import (
+    KPRELanguageLayer,
+    FedLanguageSignal,
+    SECRiskDriftSignal,
+    EarningsLanguageSignal,
+)
 from kepe.kpre_capital import (
     KPRECapitalLayer,
     InsiderTransactionSignal,
@@ -908,4 +914,255 @@ class TestKPRECapital:
         assert profile_cap.wfs >= profile_base.wfs, (
             f"Positive KPRE_CAPITAL should raise WFS: "
             f"{profile_base.wfs:.3f} → {profile_cap.wfs:.3f}"
+        )
+
+
+# ─── KPRE Language Field Layer Tests ─────────────────────────────────────────
+
+class TestKPRELanguage:
+    """
+    Tests for KPRE Language Field layer using synthetic text.
+    No network calls — all scoring methods are tested directly.
+    """
+
+    # ── FedLanguageSignal scoring ────────────────────────────────────────────
+
+    def test_fed_tightening_language_negative(self):
+        """Dominant tightening language → negative signal."""
+        text = (
+            "inflation elevated inflation restrictive above target overheating "
+            "tightening tightening price stability inflation hike"
+        )
+        scores = FedLanguageSignal._score_speech_text(text)
+        assert scores["signal"] < 0, \
+            f"Tightening language should be negative, got {scores['signal']:.3f}"
+
+    def test_fed_easing_language_positive(self):
+        """Dominant easing language → positive signal."""
+        text = (
+            "cooling softening normalize accommodative will commit "
+            "below target disinflation cut easing slowdown"
+        )
+        scores = FedLanguageSignal._score_speech_text(text)
+        assert scores["signal"] > 0, \
+            f"Easing language should be positive, got {scores['signal']:.3f}"
+
+    def test_fed_uncertainty_dampens_signal(self):
+        """High uncertainty should produce a weaker (less negative) tightening signal."""
+        certain_tight = "inflation restrictive elevated tightening hike above target"
+        uncertain_tight = (
+            "uncertain unclear monitor cautious vigilant "
+            "inflation restrictive elevated tightening"
+        )
+        s_certain   = FedLanguageSignal._score_speech_text(certain_tight)
+        s_uncertain = FedLanguageSignal._score_speech_text(uncertain_tight)
+        # Uncertain version should be less negative (closer to 0)
+        assert s_uncertain["signal"] > s_certain["signal"], (
+            f"Uncertainty should dampen tightening: "
+            f"certain={s_certain['signal']:.3f}, uncertain={s_uncertain['signal']:.3f}"
+        )
+
+    def test_fed_signal_in_bounds(self):
+        """Fed signal must be within [-1, 1]."""
+        text = "inflation inflation inflation tightening restrictive elevated hike above target"
+        scores = FedLanguageSignal._score_speech_text(text)
+        assert -1.0 <= scores["signal"] <= 1.0
+
+    def test_fed_neutral_text_near_zero(self):
+        """Neutral text (no keywords) → signal near zero."""
+        text = "the committee reviewed economic data and discussed various perspectives"
+        scores = FedLanguageSignal._score_speech_text(text)
+        assert abs(scores["signal"]) < 0.3, \
+            f"Neutral text should be near zero, got {scores['signal']:.3f}"
+
+    def test_fed_returns_required_keys(self):
+        """Score dict must contain all required keys."""
+        scores = FedLanguageSignal._score_speech_text("test text")
+        for key in ("uncertainty_density", "tightening_density", "easing_density",
+                    "policy_direction", "certainty", "signal"):
+            assert key in scores, f"Missing key: {key}"
+
+    # ── SECRiskDriftSignal scoring ────────────────────────────────────────────
+
+    def test_risk_drift_new_climate_positive(self):
+        """New climate language in 10-K → positive (country-layer awakening)."""
+        old = {"climate": 2, "regulatory": 10}
+        new = {"climate": 8, "regulatory": 10}
+        value, raw = SECRiskDriftSignal._score_risk_drift(old, new, 5000, 5000)
+        assert value > 0, f"New climate language should be positive, got {value:.3f}"
+
+    def test_risk_drift_same_counts_neutral(self):
+        """Same keyword counts in both filings → near-zero drift."""
+        counts = {"climate": 5, "regulatory": 10, "litigation": 3, "cybersecurity": 2}
+        value, raw = SECRiskDriftSignal._score_risk_drift(counts, counts, 5000, 5000)
+        assert abs(value) < 0.01, f"Same counts should be ~0, got {value:.4f}"
+
+    def test_risk_drift_new_litigation_negative(self):
+        """More litigation language → negative (interference loading)."""
+        old = {"litigation": 2}
+        new = {"litigation": 10}
+        value, raw = SECRiskDriftSignal._score_risk_drift(old, new, 5000, 5000)
+        assert value < 0, f"New litigation should be negative, got {value:.3f}"
+
+    def test_risk_drift_new_cyber_negative(self):
+        """Rising cybersecurity risk language → negative signal."""
+        old = {"cybersecurity": 1, "breach": 0}
+        new = {"cybersecurity": 5, "breach": 3}
+        value, _ = SECRiskDriftSignal._score_risk_drift(old, new, 5000, 5000)
+        assert value < 0
+
+    def test_risk_drift_value_in_bounds(self):
+        """Drift signal must be in [-1, 1]."""
+        old = {"climate": 0, "litigation": 0}
+        new = {"climate": 100, "litigation": 0}
+        value, _ = SECRiskDriftSignal._score_risk_drift(old, new, 5000, 5000)
+        assert -1.0 <= value <= 1.0
+
+    def test_risk_drift_raw_contains_details(self):
+        """Raw output should include drift_details and n_drifted."""
+        old = {"climate": 3}
+        new = {"climate": 8}
+        _, raw = SECRiskDriftSignal._score_risk_drift(old, new, 5000, 5000)
+        assert "n_drifted" in raw
+        assert raw["n_drifted"] >= 1
+
+    def test_count_keywords_basic(self):
+        """Keyword counter should find expected keywords in text."""
+        text = "climate risk climate environmental sustainability litigation lawsuit"
+        counts = SECRiskDriftSignal._count_keywords(text)
+        assert counts.get("climate", 0) >= 2
+        assert counts.get("litigation", 0) >= 1
+
+    def test_extract_risk_section_finds_header(self):
+        """Risk section extractor should find 'Item 1A Risk Factors' text."""
+        html = (
+            "<html><body><p>Item 1 Business section text here.</p>"
+            "<p>Item 1A. Risk Factors</p>"
+            "<p>The company faces climate risks and litigation risks.</p>"
+            "<p>Item 2. Properties</p></body></html>"
+        )
+        text = SECRiskDriftSignal._extract_risk_section(html)
+        assert "climate" in text.lower(), "Should extract climate risk mention"
+        assert "litigation" in text.lower()
+
+    # ── EarningsLanguageSignal scoring ───────────────────────────────────────
+
+    def test_earnings_confident_positive(self):
+        """Strong, confident language → positive signal."""
+        text = (
+            "strong robust exceeded record growth accelerating momentum "
+            "delivering expanding outperform raised guidance increased ahead beat"
+        )
+        scores = EarningsLanguageSignal._score_earnings_text(text)
+        assert scores["signal"] > 0, \
+            f"Confident earnings language should be positive, got {scores['signal']:.3f}"
+
+    def test_earnings_hedging_negative(self):
+        """Hedging language dominant → negative signal."""
+        text = (
+            "may might could potentially challenging uncertain difficult "
+            "headwinds unforeseen subject to concerns softer cautious disappointing"
+        )
+        scores = EarningsLanguageSignal._score_earnings_text(text)
+        assert scores["signal"] < 0, \
+            f"Hedging earnings language should be negative, got {scores['signal']:.3f}"
+
+    def test_earnings_signal_in_bounds(self):
+        """Earnings signal must be in [-1, 1]."""
+        text = "strong growth but may face uncertain challenging potentially difficult headwinds"
+        scores = EarningsLanguageSignal._score_earnings_text(text)
+        assert -1.0 <= scores["signal"] <= 1.0
+
+    def test_earnings_investing_language_boosts(self):
+        """Forward investment language alongside confidence → stronger positive."""
+        text_invest = "strong growth investing capex research expand build innovate"
+        text_return  = "strong growth dividend buyback repurchase returning capital yield"
+        s_invest = EarningsLanguageSignal._score_earnings_text(text_invest)
+        s_return  = EarningsLanguageSignal._score_earnings_text(text_return)
+        # Both should be positive (confident), but investing language should
+        # produce at least as high a signal as return-capital language
+        assert s_invest["signal"] >= s_return["signal"], (
+            f"Investment language should be ≥ return-capital: "
+            f"invest={s_invest['signal']:.3f}, return={s_return['signal']:.3f}"
+        )
+
+    def test_earnings_returns_required_keys(self):
+        """Score dict must include all required keys."""
+        scores = EarningsLanguageSignal._score_earnings_text("test")
+        for key in ("confidence_density", "hedging_density", "invest_signal", "signal"):
+            assert key in scores, f"Missing key: {key}"
+
+    # ── KPRELanguageLayer aggregation ────────────────────────────────────────
+
+    def _lang_sig(self, value: float, confidence: float = 0.50,
+                  evidence: str = "TESTABLE") -> WorldSignal:
+        return WorldSignal(
+            domain="LANGUAGE", source="test_language_sub",
+            region="GLOBAL", value=value, confidence=confidence,
+            evidence_level=evidence, timestamp=datetime.utcnow(),
+            temporal_layer="MEDIUM",
+        )
+
+    def test_language_layer_empty_zero(self):
+        """Empty input → zero confidence and value."""
+        result = KPRELanguageLayer._aggregate([])
+        assert result.confidence == 0.0
+        assert result.value == 0.0
+        assert result.domain == "LANGUAGE"
+
+    def test_language_confidence_capped_at_060(self):
+        """Language composite confidence ≤ 0.60 (TESTABLE ceiling)."""
+        sigs = [self._lang_sig(0.5, confidence=0.95) for _ in range(3)]
+        result = KPRELanguageLayer._aggregate(sigs)
+        assert result.confidence <= 0.60, \
+            f"Language confidence should cap at 0.60, got {result.confidence:.3f}"
+
+    def test_language_positive_signals(self):
+        """All positive language signals → positive composite."""
+        sigs = [self._lang_sig(0.7), self._lang_sig(0.6), self._lang_sig(0.5)]
+        result = KPRELanguageLayer._aggregate(sigs)
+        assert result.value > 0
+
+    def test_language_negative_signals(self):
+        """All negative language signals → negative composite."""
+        sigs = [self._lang_sig(-0.7), self._lang_sig(-0.5)]
+        result = KPRELanguageLayer._aggregate(sigs)
+        assert result.value < 0
+
+    def test_language_evidence_is_testable(self):
+        """All language signals are at most TESTABLE (no ESTABLISHED NLP)."""
+        sigs = [self._lang_sig(0.5, evidence="TESTABLE")]
+        result = KPRELanguageLayer._aggregate(sigs)
+        assert result.evidence_level in ("TESTABLE", "SPECULATIVE")
+
+    def test_language_partial_lower_confidence(self):
+        """1/3 signals → lower confidence than 3/3."""
+        sigs_3 = [self._lang_sig(0.5, 0.55) for _ in range(3)]
+        sigs_1 = [self._lang_sig(0.5, 0.55)]
+        r3 = KPRELanguageLayer._aggregate(sigs_3)
+        r1 = KPRELanguageLayer._aggregate(sigs_1)
+        assert r1.confidence < r3.confidence
+
+    def test_language_raw_completeness(self):
+        """raw.completeness = n_signals / 3."""
+        sigs = [self._lang_sig(0.5), self._lang_sig(0.3)]
+        result = KPRELanguageLayer._aggregate(sigs)
+        assert result.raw.get("completeness") == pytest.approx(2 / 3, abs=0.01)
+
+    def test_language_shifts_wfs(self):
+        """Strongly positive language signal should shift WFS up."""
+        base = [_world_sig("SOCIAL", 0.5), _world_sig("ECOLOGICAL", 0.4)]
+        profile_base = synthesise_kepe_profile("TEST", base)
+
+        lang_positive = WorldSignal(
+            domain="LANGUAGE", source="test_lang",
+            region="GLOBAL", value=0.85, confidence=0.55,
+            evidence_level="TESTABLE", timestamp=datetime.utcnow(),
+            temporal_layer="MEDIUM",
+        )
+        profile_lang = synthesise_kepe_profile("TEST", base + [lang_positive])
+
+        assert profile_lang.wfs >= profile_base.wfs, (
+            f"Positive language signal should raise WFS: "
+            f"{profile_base.wfs:.3f} → {profile_lang.wfs:.3f}"
         )
