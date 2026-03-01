@@ -59,6 +59,7 @@ from kepe.kpre_capital import KPRECapitalLayer
 from kepe.kpre_language import KPRELanguageLayer
 from kepe.syntropy_engine import synthesise_kepe_profile, KEPEProfile
 from cmam.cmam_engine import CMAMEngine, CMAMProfile, TradeClassification
+from sas.sas_engine import SASEngine, SASProfile
 from dfte.dfte_engine import (
     BMRSummary, KEPESummary, synthesise_dfte_signal, DFTESignal
 )
@@ -350,7 +351,33 @@ def analyse_symbol(
             dfte_signal.all_gates_passed = False
         dfte_signal.rationale += f" | GOV: {gov_reason}"
 
-    return (dfte_signal, kepe)
+    # 5. SAS — Syntropy Authenticity Score
+    try:
+        sas = SASEngine().compute(symbol, kepe)
+        if sas.wolf_confirmed and dfte_signal.action not in ("BLOCKED", "HOLD"):
+            logger.warning(
+                f"SAS wolf confirmed [{symbol}]: score={sas.sas_score:.2f} — "
+                f"blocking long. Notes: {sas.notes}"
+            )
+            dfte_signal.action = "BLOCKED"
+            dfte_signal.position_size_pct = 0.0
+            dfte_signal.governance_gate = False
+            dfte_signal.all_gates_passed = False
+            dfte_signal.rationale += f" | SAS WOLF: score={sas.sas_score:.2f}"
+        elif sas.short_candidate:
+            logger.info(
+                f"SAS short candidate [{symbol}]: wolf={sas.wolf_score:.2f}, "
+                f"STS=DETERIORATING. CMAM cooling-off gate applies."
+            )
+            dfte_signal.rationale += (
+                f" | SAS SHORT_CANDIDATE: wolf={sas.wolf_score:.2f} "
+                "entropy→syntropy conversion reasoning"
+            )
+    except Exception as e:
+        logger.warning(f"SASEngine failed for {symbol}: {e}")
+        sas = None
+
+    return (dfte_signal, kepe, sas)
 
 
 def run_basket(
@@ -370,6 +397,7 @@ def run_basket(
     signals: Dict[str, DFTESignal] = {}
     portfolio: Dict[str, float] = {}
     trade_classifications: Dict[str, TradeClassification] = {}
+    sas_profiles: Dict[str, SASProfile] = {}
 
     # ── CMAM initialisation ──────────────────────────────────────────────────
     wallet      = get_wallet(wallet_mode)
@@ -387,7 +415,9 @@ def run_basket(
         result = analyse_symbol(symbol, timeframe, base_risk_pct)
         if result is None:
             continue
-        sig, kepe = result
+        sig, kepe, sas = result
+        if sas is not None:
+            sas_profiles[symbol] = sas
 
         # Mirror gate
         mc = CMAMEngine.mirror_check(sig.rationale)
@@ -487,7 +517,7 @@ def run_basket(
                 else:
                     logger.error(f"✗ Order failed for {symbol}: {result.error}")
 
-    return signals, cmam_profile, trade_classifications
+    return signals, cmam_profile, trade_classifications, sas_profiles
 
 
 # ─── Terminal dashboard ───────────────────────────────────────────────────────
@@ -496,6 +526,7 @@ def print_dashboard(
     signals: Dict[str, DFTESignal],
     cmam_profile: Optional[CMAMProfile] = None,
     trade_classifications: Optional[Dict[str, TradeClassification]] = None,
+    sas_profiles: Optional[dict] = None,
 ):
     """Rich terminal dashboard of DFTE signals."""
     try:
@@ -526,6 +557,7 @@ def print_dashboard(
         table.add_column("Gates",     width=6)
         table.add_column("STS",       width=8)
         table.add_column("Position",  width=14)
+        table.add_column("SAS",       width=7)
 
         for symbol, sig in sorted(signals.items()):
             action_colour = {
@@ -566,6 +598,23 @@ def print_dashboard(
                 "BLOCKED":      "red",
             }.get(sts_pos, "white")
 
+            sas_map   = sas_profiles or {}
+            sas_p     = sas_map.get(symbol)
+            if sas_p:
+                sas_col = sas_p.sas_score
+                sas_colour = (
+                    "green"  if sas_col >= 0.65 else
+                    "yellow" if sas_col >= 0.35 else
+                    "red"
+                )
+                sas_str = f"[{sas_colour}]{sas_col:.2f}[/{sas_colour}]"
+                if sas_p.wolf_confirmed:
+                    sas_str += "[red]W[/red]"
+                elif sas_p.short_candidate:
+                    sas_str += "[yellow]S[/yellow]"
+            else:
+                sas_str = "[dim]n/a[/dim]"
+
             table.add_row(
                 f"[bold]{symbol}[/bold]",
                 f"[{action_colour}]{sig.action}[/{action_colour}]",
@@ -578,6 +627,7 @@ def print_dashboard(
                 gates,
                 f"[{sts_colour}]{sts}[/{sts_colour}]",
                 f"[{pos_colour}]{sts_pos}[/{pos_colour}]",
+                sas_str,
             )
 
         console.print(table)
@@ -632,6 +682,37 @@ def print_dashboard(
                 "\n".join(cmam_lines),
                 title="[bold blue]CMAM — Capital Maturity Allocation[/bold blue]",
                 border_style="blue",
+            ))
+
+        # SAS panel
+        if sas_profiles:
+            sas_lines = []
+            for sym in sorted(sas_profiles):
+                sp = sas_profiles[sym]
+                wolf_flag = (
+                    " [red][WOLF CONFIRMED][/red]"    if sp.wolf_confirmed  else
+                    " [yellow][SHORT CANDIDATE][/yellow]" if sp.short_candidate else ""
+                )
+                sas_colour = (
+                    "green"  if sp.sas_score >= 0.65 else
+                    "yellow" if sp.sas_score >= 0.35 else
+                    "red"
+                )
+                sas_lines.append(
+                    f"  {sym:<6} SAS=[{sas_colour}]{sp.sas_score:.2f}[/{sas_colour}]"
+                    f"  wolf={sp.wolf_score:.2f}"
+                    f"  rev={sp.revenue_coherence:.2f}"
+                    f"  capex={sp.capex_direction:.2f}"
+                    f"  opac={sp.opacity_score:.2f}"
+                    f"  ssi_gap={sp.ssi_gap:.2f}"
+                    + wolf_flag
+                )
+                for note in sp.notes[:2]:
+                    sas_lines.append(f"         [dim]{note[:75]}[/dim]")
+            console.print(Panel(
+                "\n".join(sas_lines),
+                title="[bold magenta]SAS — Syntropy Authenticity Score[/bold magenta]",
+                border_style="magenta",
             ))
 
         # Recent influence log
@@ -708,25 +789,25 @@ def main():
 
     if args.watch:
         while True:
-            signals, cmam_profile, trade_classifications = run_basket(
+            signals, cmam_profile, trade_classifications, sas_profiles = run_basket(
                 symbols=args.symbols,
                 timeframe=args.timeframe,
                 base_risk_pct=args.risk,
                 execute=args.execute,
                 wallet_mode=args.mode,
             )
-            print_dashboard(signals, cmam_profile, trade_classifications)
+            print_dashboard(signals, cmam_profile, trade_classifications, sas_profiles)
             logger.info("Sleeping 5 minutes...")
             time.sleep(300)
     else:
-        signals, cmam_profile, trade_classifications = run_basket(
+        signals, cmam_profile, trade_classifications, sas_profiles = run_basket(
             symbols=args.symbols,
             timeframe=args.timeframe,
             base_risk_pct=args.risk,
             execute=args.execute,
             wallet_mode=args.mode,
         )
-        print_dashboard(signals, cmam_profile, trade_classifications)
+        print_dashboard(signals, cmam_profile, trade_classifications, sas_profiles)
 
 
 if __name__ == "__main__":

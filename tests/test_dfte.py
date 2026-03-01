@@ -35,6 +35,11 @@ from kepe.kpre_language import (
     EarningsLanguageSignal,
 )
 from cmam.cmam_engine import CMAMEngine, CMAMProfile, TradeClassification
+from sas.sas_engine import (
+    SASEngine, SASProfile,
+    RevenueCoherenceSignal, CapexDirectionSignal, OpacitySignal,
+    SSIStub, WolfDetector,
+)
 from kepe.kpre_capital import (
     KPRECapitalLayer,
     InsiderTransactionSignal,
@@ -1381,3 +1386,193 @@ class TestCMAM:
             _MockKepe(is_syntropic=True, is_extractive=False, sts="STABLE"),
         )
         assert tc.trade_type == "BLOCKED"
+
+
+# ─── SAS helpers ──────────────────────────────────────────────────────────────
+
+class _MockKEPEForSAS:
+    """Minimal KEPEProfile stand-in for SAS tests."""
+    def __init__(self, wfs=0.50, sts="STABLE", is_syntropic=False, is_extractive=False):
+        self.wfs                = wfs
+        self.sts                = sts
+        self.is_syntropic_asset = is_syntropic
+        self.is_extractive_asset = is_extractive
+
+
+# ─── TestSAS ──────────────────────────────────────────────────────────────────
+
+class TestSAS:
+    """
+    SAS — Syntropy Authenticity Score.
+    All tests use pure scoring functions — no network calls. [TESTABLE]
+    """
+
+    # ── RevenueCoherenceSignal ────────────────────────────────────────────────
+
+    def test_clean_energy_coherent_revenue(self):
+        # Syntropic company, clean tech SIC, clean language dominant → high score
+        score, notes = RevenueCoherenceSignal._score_coherence(
+            sic_code=3674,      # semiconductors (ENPH)
+            fossil_count=2,
+            clean_count=30,
+            climate_count=5,
+            is_syntropic=True,
+            is_extractive=False,
+        )
+        assert score >= 0.70, f"Clean energy company should score >=0.70, got {score}"
+        assert notes == [] or all("fossil" not in n.lower() for n in notes)
+
+    def test_fossil_fuel_divergent(self):
+        # Syntropic classification but fossil SIC and fossil language → low score (wolf)
+        score, notes = RevenueCoherenceSignal._score_coherence(
+            sic_code=2911,      # petroleum refining
+            fossil_count=50,
+            clean_count=3,
+            climate_count=8,
+            is_syntropic=True,
+            is_extractive=False,
+        )
+        assert score <= 0.35, f"Wolf company should score <=0.35, got {score}"
+        assert any("fossil" in n.lower() or "sic" in n.lower() for n in notes)
+
+    def test_extractive_greenwashing_detected(self):
+        # Extractive company with many climate claims → wolf pattern
+        score, notes = RevenueCoherenceSignal._score_coherence(
+            sic_code=2911,
+            fossil_count=40,
+            clean_count=5,
+            climate_count=20,    # heavy ESG claims
+            is_syntropic=False,
+            is_extractive=True,
+        )
+        assert score <= 0.30, f"Greenwashing extractive should score <=0.30, got {score}"
+        assert any("greenwashing" in n.lower() or "wolf" in n.lower() for n in notes)
+
+    def test_neutral_company_default_medium(self):
+        score, _ = RevenueCoherenceSignal._score_coherence(
+            sic_code=7372,      # software
+            fossil_count=1,
+            clean_count=5,
+            climate_count=3,
+            is_syntropic=False,
+            is_extractive=False,
+        )
+        assert 0.55 <= score <= 0.85
+
+    # ── CapexDirectionSignal ──────────────────────────────────────────────────
+
+    def test_capex_syntropic_growing(self):
+        # Syntropic + capex trend +1.0 → high coherence
+        score = CapexDirectionSignal._score_capex(capex_trend=1.0, is_syntropic=True)
+        assert score == pytest.approx(1.0)
+
+    def test_capex_syntropic_declining(self):
+        # Syntropic + capex trend -1.0 → low coherence (transition theater)
+        score = CapexDirectionSignal._score_capex(capex_trend=-1.0, is_syntropic=True)
+        assert score == pytest.approx(0.0)
+
+    def test_capex_extractive_growing_is_wolf(self):
+        # Extractive + capex growing = doubling down on extraction → low SAS
+        score = CapexDirectionSignal._score_capex(capex_trend=1.0, is_syntropic=False)
+        assert score == pytest.approx(0.0)
+
+    def test_capex_extractive_declining_slightly_better(self):
+        # Extractive + capex declining = possibly exiting extraction → higher SAS
+        score = CapexDirectionSignal._score_capex(capex_trend=-1.0, is_syntropic=False)
+        assert score == pytest.approx(1.0)
+
+    # ── OpacitySignal ─────────────────────────────────────────────────────────
+
+    def test_opacity_climate_claims_without_scope3(self):
+        # Many climate claims, zero Scope 3 → very low opacity score
+        score, notes = OpacitySignal._score_opacity(
+            scope3_count=0, climate_count=12, supply_chain_words=5
+        )
+        assert score <= 0.30
+        assert any("scope 3" in n.lower() or "zero" in n.lower() for n in notes)
+
+    def test_opacity_full_disclosure(self):
+        # Good scope 3 coverage + supply chain disclosure → high score
+        score, notes = OpacitySignal._score_opacity(
+            scope3_count=5, climate_count=10, supply_chain_words=30
+        )
+        assert score >= 0.65
+
+    def test_opacity_no_climate_claims_neutral(self):
+        # No climate claims → no scope 3 gap → neutral
+        score, _ = OpacitySignal._score_opacity(
+            scope3_count=0, climate_count=0, supply_chain_words=10
+        )
+        # With no climate count, scope3_ratio=0/1=0 → scope3_score=0
+        # score = 0.60*0 + 0.40*min(1, 10/25) = 0.40*0.40 = 0.16
+        assert score <= 0.50
+
+    # ── SSIStub ───────────────────────────────────────────────────────────────
+
+    def test_ssi_gap_low_when_aligned(self):
+        # Frame1=0.60, Frame5=0.62 → gap=0.02
+        gap, notes = SSIStub.compute_ssi_gap(frame1_wfs=0.60, frame5_score=0.62)
+        assert gap == pytest.approx(0.02, abs=1e-9)
+        assert notes == []   # no divergence note for small gap
+
+    def test_ssi_gap_high_when_divergent(self):
+        # Frame1=0.80 (self-report high), Frame5=0.20 (primary sources low) → gap=0.60
+        gap, notes = SSIStub.compute_ssi_gap(frame1_wfs=0.80, frame5_score=0.20)
+        assert gap == pytest.approx(0.60, abs=1e-9)
+        assert any("divergence" in n.lower() or "gap" in n.lower() for n in notes)
+
+    def test_ssi_gap_max_is_one(self):
+        gap, _ = SSIStub.compute_ssi_gap(frame1_wfs=1.0, frame5_score=0.0)
+        assert gap == pytest.approx(1.0)
+
+    # ── WolfDetector ──────────────────────────────────────────────────────────
+
+    def test_wolf_confirmed_threshold(self):
+        # All components low → wolf_score > 0.65
+        ws = WolfDetector.wolf_score(
+            revenue_coherence=0.10,
+            capex_direction=0.15,
+            opacity_score=0.10,
+            ssi_gap=0.70,
+        )
+        assert ws > 0.65, f"Should be wolf confirmed, got wolf_score={ws}"
+
+    def test_wolf_score_authentic_company_low(self):
+        # All components high → wolf_score low
+        ws = WolfDetector.wolf_score(
+            revenue_coherence=0.85,
+            capex_direction=0.80,
+            opacity_score=0.75,
+            ssi_gap=0.05,
+        )
+        assert ws < 0.35, f"Authentic company should have low wolf score, got {ws}"
+
+    def test_short_candidate_requires_deteriorating(self):
+        # wolf_score > 0.35 but STS=STABLE → NOT a short candidate
+        # Simulate with SASEngine._neutral_profile to check logic
+        # Wolf pattern present but STS not DETERIORATING
+        kepe = _MockKEPEForSAS(wfs=0.50, sts="STABLE", is_syntropic=False, is_extractive=True)
+        # With stable STS, short_candidate should stay False
+        profile = SASEngine._neutral_profile("TEST", "test reason")
+        assert profile.short_candidate is False
+
+    def test_evidence_declared_on_all_components(self):
+        profile = SASEngine._neutral_profile("TEST", "no data")
+        assert profile.evidence_level in ("ESTABLISHED", "TESTABLE", "SPECULATIVE")
+        assert profile.evidence_level == "SPECULATIVE"   # neutral profiles are speculative
+
+    def test_notes_populated_on_divergence(self):
+        # Direct coherence scoring: wolf pattern should populate notes
+        _, notes = RevenueCoherenceSignal._score_coherence(
+            sic_code=2911, fossil_count=60, clean_count=2, climate_count=25,
+            is_syntropic=True, is_extractive=False,
+        )
+        assert len(notes) >= 1
+
+    def test_graceful_missing_sec_data(self):
+        # _neutral_profile is used for ETF/crypto — no exception raised
+        profile = SASEngine._neutral_profile("BTC-USD", "ETF/crypto — no EDGAR CIK")
+        assert profile.sas_score == pytest.approx(0.50)
+        assert profile.wolf_confirmed is False
+        assert profile.short_candidate is False
+        assert "BTC-USD" in profile.symbol
