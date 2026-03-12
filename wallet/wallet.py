@@ -26,10 +26,12 @@ from __future__ import annotations
 import os
 import logging
 import json
+import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
-from datetime import datetime
+from datetime import datetime, timezone
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -111,17 +113,61 @@ class BaseWallet(ABC):
 
 class PaperWallet(BaseWallet):
     """
-    Simulated paper trading wallet.
-    No external API required.
+    Simulated paper trading wallet with True Persistence.
     Tracks virtual positions and P&L.
-    Used for backtesting and development.
+    Persists state to wallet_state.json.
     """
 
-    def __init__(self, initial_cash: float = 100_000.0):
+    STATE_FILE = "wallet_state.json"
+
+    def __init__(self, initial_cash: float = 100_000.0, persistence: bool = True):
+        self._initial_cash = initial_cash
         self._cash = initial_cash
         self._positions: Dict[str, Position] = {}
         self._orders: List[OrderResult] = []
-        logger.info(f"PaperWallet initialised: ${initial_cash:,.2f}")
+        self._persistence = persistence
+        self._price_cache: Dict[str, float] = {}
+        
+        if self._persistence:
+            self._load_state()
+        logger.info(f"PaperWallet ready: ${self._cash:,.2f} cash, {len(self._positions)} positions")
+
+    def _load_state(self):
+        """Load state from disk if exists."""
+        if os.path.exists(self.STATE_FILE):
+            try:
+                with open(self.STATE_FILE, "r") as f:
+                    state = json.load(f)
+                    if "cash" in state:
+                        self._cash = float(state["cash"])
+                    pos_data = state.get("positions", {})
+                    self._positions = {
+                        sym: Position(**p) for sym, p in pos_data.items()
+                    }
+                    logger.info(f"Loaded wallet state from {self.STATE_FILE}")
+            except Exception as e:
+                logger.error(f"Failed to load wallet state: {e}")
+
+    def _save_state(self):
+        """Save current state to disk."""
+        if not self._persistence:
+            return
+        try:
+            state = {
+                "cash": self._cash,
+                "positions": {
+                    sym: {
+                        "symbol": p.symbol, "qty": p.qty, "avg_entry": p.avg_entry,
+                        "market_value": p.market_value, "unrealised_pnl": p.unrealised_pnl,
+                        "side": p.side
+                    } for sym, p in self._positions.items()
+                },
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+            with open(self.STATE_FILE, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save wallet state: {e}")
 
     @property
     def is_paper(self) -> bool:
@@ -131,49 +177,60 @@ class PaperWallet(BaseWallet):
         return self._cash
 
     def get_portfolio_value(self) -> float:
+        self._update_market_values()
         pos_value = sum(p.market_value for p in self._positions.values())
         return self._cash + pos_value
 
+    def price_pulse(self, symbols: List[str]):
+        """
+        Parallel fetch of all symbols in the basket to minimize loop latency.
+        'Pulse traffic' approach.
+        """
+        if not symbols: return
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(self._fetch_remote_price, s): s for s in symbols}
+            for f in futures:
+                sym = futures[f]
+                price = f.result()
+                if price:
+                    self._price_cache[sym] = price
+
+    def _update_market_values(self):
+        """Fetch current prices and update position market values/PNL."""
+        self.price_pulse(list(self._positions.keys()))
+        for sym, pos in self._positions.items():
+            price = self._get_price(sym)
+            if price:
+                pos.market_value = pos.qty * price
+                pos.unrealised_pnl = (price - pos.avg_entry) * pos.qty
+
     def get_positions(self) -> List[Position]:
+        self._update_market_values()
         return list(self._positions.values())
 
     def submit_order(self, order: OrderRequest) -> OrderResult:
-        """
-        Simulate order execution at mid-price.
-        In real use: connects to broker API.
-        """
+        """Simulate order execution and persist state."""
         try:
-            # Get current price via yfinance
             price = self._get_price(order.symbol)
-
             if price is None:
                 return OrderResult(
-                    success=False, order_id=None,
-                    symbol=order.symbol, side=order.side,
-                    qty=order.qty, fill_price=None,
-                    status="rejected", broker="paper",
-                    timestamp=datetime.utcnow(),
-                    error=f"Cannot get price for {order.symbol}"
+                    success=False, order_id=None, symbol=order.symbol, side=order.side,
+                    qty=order.qty, fill_price=None, status="rejected", broker="paper",
+                    timestamp=datetime.now(timezone.utc), error=f"Cannot get price for {order.symbol}"
                 )
 
-            # Calculate qty from notional if needed
             qty = order.qty
             if qty is None and order.notional:
                 qty = order.notional / price
-            if qty is None:
-                qty = 1.0
-
-            cost = qty * price
+            if qty is None: qty = 1.0
 
             if order.side == "buy":
+                cost = qty * price
                 if cost > self._cash:
                     return OrderResult(
-                        success=False, order_id=None,
-                        symbol=order.symbol, side=order.side,
-                        qty=qty, fill_price=price,
-                        status="rejected", broker="paper",
-                        timestamp=datetime.utcnow(),
-                        error=f"Insufficient cash: need ${cost:,.2f}, have ${self._cash:,.2f}"
+                        success=False, order_id=None, symbol=order.symbol, side=order.side,
+                        qty=qty, fill_price=price, status="rejected", broker="paper",
+                        timestamp=datetime.now(timezone.utc), error="Insufficient cash"
                     )
                 self._cash -= cost
                 if order.symbol in self._positions:
@@ -181,72 +238,63 @@ class PaperWallet(BaseWallet):
                     new_qty = pos.qty + qty
                     new_avg = (pos.avg_entry * pos.qty + price * qty) / new_qty
                     self._positions[order.symbol] = Position(
-                        symbol=order.symbol, qty=new_qty,
-                        avg_entry=new_avg, market_value=new_qty * price,
-                        unrealised_pnl=(price - new_avg) * new_qty,
+                        symbol=order.symbol, qty=new_qty, avg_entry=new_avg,
+                        market_value=new_qty * price, unrealised_pnl=(price - new_avg) * new_qty,
                         side="long"
                     )
                 else:
                     self._positions[order.symbol] = Position(
-                        symbol=order.symbol, qty=qty,
-                        avg_entry=price, market_value=qty * price,
-                        unrealised_pnl=0.0, side="long"
+                        symbol=order.symbol, qty=qty, avg_entry=price,
+                        market_value=qty * price, unrealised_pnl=0.0, side="long"
                     )
 
             elif order.side == "sell":
                 if order.symbol in self._positions:
                     pos = self._positions[order.symbol]
                     sell_qty = min(qty, pos.qty)
-                    proceeds = sell_qty * price
-                    self._cash += proceeds
+                    self._cash += sell_qty * price
                     remaining = pos.qty - sell_qty
                     if remaining < 0.001:
                         del self._positions[order.symbol]
                     else:
-                        self._positions[order.symbol] = Position(
-                            symbol=order.symbol, qty=remaining,
-                            avg_entry=pos.avg_entry,
-                            market_value=remaining * price,
-                            unrealised_pnl=(price - pos.avg_entry) * remaining,
-                            side="long"
-                        )
+                        pos.qty = remaining
+                        pos.market_value = remaining * price
+                        pos.unrealised_pnl = (price - pos.avg_entry) * remaining
 
-            order_id = f"paper_{order.symbol}_{int(datetime.utcnow().timestamp())}"
-            result = OrderResult(
-                success=True, order_id=order_id,
-                symbol=order.symbol, side=order.side,
-                qty=qty, fill_price=price,
-                status="paper", broker="paper",
-                timestamp=datetime.utcnow(),
-                raw={"notional": qty * price, "tier": order.tier}
+            self._save_state()
+            order_id = f"paper_{order.symbol}_{int(datetime.now(timezone.utc).timestamp())}"
+            res = OrderResult(
+                success=True, order_id=order_id, symbol=order.symbol, side=order.side,
+                qty=qty, fill_price=price, status="paper", broker="paper",
+                timestamp=datetime.now(timezone.utc)
             )
-            self._orders.append(result)
+            self._orders.append(res)
             logger.info(
                 f"[PAPER] {order.side.upper()} {qty:.4f} {order.symbol} @ ${price:.4f} "
                 f"(${qty*price:,.2f}) [{order.tier}]"
             )
-            return result
-
+            return res
         except Exception as e:
             logger.error(f"PaperWallet order error: {e}")
-            return OrderResult(
-                success=False, order_id=None,
-                symbol=order.symbol, side=order.side,
-                qty=order.qty, fill_price=None,
-                status="error", broker="paper",
-                timestamp=datetime.utcnow(),
-                error=str(e)
-            )
+            return OrderResult(success=False, order_id=None, symbol=order.symbol, side=order.side, qty=None, fill_price=None, status="error", broker="paper", timestamp=datetime.now(timezone.utc), error=str(e))
 
     def cancel_order(self, order_id: str) -> bool:
-        return True  # Paper orders are instant
+        return True 
 
     def _get_price(self, symbol: str) -> Optional[float]:
+        if symbol in self._price_cache:
+            return self._price_cache[symbol]
+        return self._fetch_remote_price(symbol)
+
+    def _fetch_remote_price(self, symbol: str) -> Optional[float]:
         try:
             import yfinance as yf
-            hist = yf.Ticker(symbol).history(period="1d")
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(period="1d")
             if not hist.empty:
-                return float(hist["Close"].iloc[-1])
+                val = float(hist["Close"].iloc[-1])
+                self._price_cache[symbol] = val
+                return val
         except Exception as e:
             logger.warning(f"Price fetch failed for {symbol}: {e}")
         return None
@@ -269,14 +317,7 @@ class PaperWallet(BaseWallet):
 class AlpacaWallet(BaseWallet):
     """
     Alpaca Markets broker integration.
-    Free paper trading API: https://alpaca.markets
-
-    Setup:
-      export ALPACA_API_KEY=your_key
-      export ALPACA_SECRET_KEY=your_secret
-      # Default is paper trading. Set ALPACA_LIVE=true for live.
     """
-
     PAPER_URL = "https://paper-api.alpaca.markets"
     LIVE_URL  = "https://api.alpaca.markets"
 
@@ -287,8 +328,7 @@ class AlpacaWallet(BaseWallet):
         self._base_url   = self.LIVE_URL if self._live else self.PAPER_URL
 
         if not self._api_key or not self._secret_key:
-            logger.warning("Alpaca credentials not set — orders will fail. "
-                         "Set ALPACA_API_KEY and ALPACA_SECRET_KEY.")
+            logger.warning("Alpaca credentials not set — orders will fail.")
 
         mode = "LIVE" if self._live else "PAPER"
         logger.info(f"AlpacaWallet initialised ({mode})")
@@ -386,7 +426,7 @@ class AlpacaWallet(BaseWallet):
                 fill_price=float(data.get("filled_avg_price") or 0) or None,
                 status=data.get("status", "submitted"),
                 broker="alpaca",
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 raw=data,
             )
         return OrderResult(
@@ -394,7 +434,7 @@ class AlpacaWallet(BaseWallet):
             symbol=order.symbol, side=order.side,
             qty=order.qty, fill_price=None,
             status="rejected", broker="alpaca",
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             error=str(data) if data else "No response from Alpaca"
         )
 
@@ -416,9 +456,9 @@ class AlpacaWallet(BaseWallet):
 def get_wallet(mode: str = "paper", **kwargs) -> BaseWallet:
     """
     Factory: get the appropriate wallet.
-      mode="paper"   → PaperWallet (no credentials needed)
-      mode="alpaca"  → AlpacaWallet (needs ALPACA_API_KEY + ALPACA_SECRET_KEY)
     """
     if mode == "alpaca":
         return AlpacaWallet()
+    # FORCE PERSISTENCE for simulated real-world growth
+    kwargs.setdefault("persistence", True)
     return PaperWallet(**kwargs)

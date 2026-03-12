@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+.gitignore
+*.md
+tests/
+.env
+*.env
+*.db
+logger/signal_history.db
+/tmp/

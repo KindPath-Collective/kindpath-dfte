@@ -42,7 +42,7 @@ import logging
 import requests
 import xml.etree.ElementTree as ET
 import numpy as np
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from typing import List, Optional, Dict, Any, Tuple
 
 from kepe.indicators import WorldSignal
@@ -240,7 +240,7 @@ class InsiderTransactionSignal:
             value=float(np.clip(value, -1, 1)),
             confidence=0.65,
             evidence_level="ESTABLISHED",
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             temporal_layer="MEDIUM",
             raw=raw,
             notes=(
@@ -393,7 +393,7 @@ class InsiderTransactionSignal:
         return WorldSignal(
             domain="KPRE_CAPITAL", source=f"sec_form4_{symbol.lower()}",
             region="US", value=0.0, confidence=0.0,
-            evidence_level="ESTABLISHED", timestamp=datetime.utcnow(),
+            evidence_level="ESTABLISHED", timestamp=datetime.now(timezone.utc),
             temporal_layer="MEDIUM",
             notes=f"InsiderTransaction [{symbol}]: no data — {reason}"
         )
@@ -443,7 +443,7 @@ class CongressionalTradingSignal:
             return WorldSignal(
                 domain="KPRE_CAPITAL", source=f"congress_{symbol.lower()}",
                 region="US", value=0.0, confidence=0.0,
-                evidence_level="TESTABLE", timestamp=datetime.utcnow(),
+                evidence_level="TESTABLE", timestamp=datetime.now(timezone.utc),
                 temporal_layer="MEDIUM",
                 notes=f"Congressional trading [{symbol}]: no disclosures in last 30 days [TESTABLE]"
             )
@@ -455,7 +455,7 @@ class CongressionalTradingSignal:
             value=float(np.clip(value, -1, 1)),
             confidence=0.45,   # moderate — lag in disclosure reduces timeliness
             evidence_level="TESTABLE",
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             temporal_layer="MEDIUM",
             raw=raw,
             notes=(
@@ -467,7 +467,7 @@ class CongressionalTradingSignal:
 
     def _fetch_recent_trades(self, symbol: str, days: int = 30) -> List[Dict[str, Any]]:
         """Fetch all congress trades and filter to symbol + date window."""
-        cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
         trades: List[Dict[str, Any]] = []
 
         for api_url, chamber in [
@@ -607,7 +607,7 @@ class CapexIntentSignal:
             value=float(np.clip(value, -1, 1)),
             confidence=0.75,
             evidence_level="ESTABLISHED",
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             temporal_layer="STRUCTURAL",
             raw=raw,
             notes=(
@@ -743,7 +743,7 @@ class CapexIntentSignal:
         return WorldSignal(
             domain="KPRE_CAPITAL", source=f"sec_capex_{symbol.lower()}",
             region="US", value=0.0, confidence=0.0,
-            evidence_level="ESTABLISHED", timestamp=datetime.utcnow(),
+            evidence_level="ESTABLISHED", timestamp=datetime.now(timezone.utc),
             temporal_layer="STRUCTURAL",
             notes=f"CapEx [{symbol}]: no data — {reason}"
         )
@@ -804,7 +804,7 @@ class KPRECapitalLayer:
                 domain="KPRE_CAPITAL", source="capital_formation_composite",
                 region="US", value=0.0, confidence=0.0,
                 evidence_level="TESTABLE",
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 temporal_layer="MEDIUM",
                 notes="No KPRE_CAPITAL sub-signals available"
             )
@@ -832,7 +832,7 @@ class KPRECapitalLayer:
             value=float(np.clip(composite_value, -1, 1)),
             confidence=float(np.clip(composite_conf, 0, 0.65)),
             evidence_level=ev_level,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             temporal_layer="MEDIUM",
             raw={
                 "n_signals":    len(sub_signals),

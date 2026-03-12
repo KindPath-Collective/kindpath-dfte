@@ -284,7 +284,7 @@ class TestGovernance:
     def test_weapons_extractive(self):
         b = score_benevolence("LMT")
         assert b.score < -0.5
-        assert b.is_blocked
+        assert b.fails_lifeguard_protocol
         assert b.tier_cap == "BLOCKED"
 
     def test_fossil_fuel_nano_only(self):
@@ -337,7 +337,7 @@ class TestWallet:
 
     @pytest.fixture
     def paper_wallet(self):
-        return PaperWallet(initial_cash=10_000.0)
+        return PaperWallet(initial_cash=10_000.0, persistence=False)
 
     def test_paper_wallet_initial_cash(self, paper_wallet):
         assert paper_wallet.get_cash() == 10_000.0
@@ -442,7 +442,7 @@ class TestIntegration:
         # Should be LARGE or MID with syntropic asset + strong fields
         assert approved_tier in ("LARGE", "MID"), \
             f"ICLN with strong fields should be LARGE/MID, got {approved_tier}"
-        assert not ben.is_blocked
+        assert not ben.fails_lifeguard_protocol
 
     def test_full_pipeline_extractive_blocked(self):
         """Extractive asset should be BLOCKED regardless of field quality."""
@@ -472,7 +472,7 @@ class TestIntegration:
 
     def test_paper_wallet_executes_buy_signal(self):
         """Paper wallet should execute a BUY signal from DFTE."""
-        wallet = PaperWallet(initial_cash=10_000.0)
+        wallet = PaperWallet(initial_cash=10_000.0, persistence=False)
         wallet._get_price = lambda s: 100.0
 
         bmr = _bmr(mfs=0.75, direction=0.6, nu=0.78, field_state="ZPB", tier="MID")
@@ -1583,7 +1583,7 @@ class TestSAS:
 import sys as _sys
 import os as _os
 _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
-_sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "..", "bmr"))
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "kindpath-bmr"))
 
 from backtest.backtest_engine import (
     run_nu_backtest,

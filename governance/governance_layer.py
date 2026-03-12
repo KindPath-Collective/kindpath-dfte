@@ -12,20 +12,14 @@ Three governance functions:
 
 2. CONTRADICTION DETECTION
    Interference Load (IL) computation per portfolio.
-   High IL = portfolio is internally contradictory
-   (e.g. holding clean energy long AND fossil fuels long = IN-Loading state).
-   Contradiction resolution: flag for review, suggest coherent rebalance.
+   High IL = portfolio is internally contradictory.
 
 3. INFLUENCE TRACKING
    Every executed trade is a participant-scale signal in BMR.
-   At scale, DFTE positions contribute to the field they read.
-   Influence log tracks the system's own contribution to field coherence.
-   This closes the feedback loop: trades → curvature shifts → updated ν.
 
-   The system is not just reading the field.
-   It is contributing to the field it reads.
-   This is the KindPath benevolence propagation mechanism
-   operating through capital rather than community intervention.
+4. MIRROR GATE
+   Checks if the trade requires us to behave like the thing we oppose.
+   "Don't become the wolf."
 """
 
 from __future__ import annotations
@@ -36,7 +30,7 @@ import logging
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +47,14 @@ SECTOR_SCORES = {
     "education":       +0.75,
     "sustainable_ag":  +0.80,
     "water":           +0.85,
+    "biotech_innovation": +0.80,
+    "mycorrhiza_biotech": +0.85,
     "housing_access":  +0.70,
     "community_bank":  +0.65,
+    "crypto_layer1":   +0.40,
+    "crypto_layer2":   +0.45,
+    "crypto_defi":     +0.35,
+    "crypto_oracle":   +0.30,
 
     # Neutral sectors (0)
     "technology":      +0.10,
@@ -73,52 +73,41 @@ SECTOR_SCORES = {
 }
 
 SYMBOL_SECTOR_MAP = {
-    # Clean energy
     "ICLN": "clean_energy", "ENPH": "clean_energy", "FSLR": "clean_energy",
     "NEE": "clean_energy", "BEP": "clean_energy", "TSLA": "clean_energy",
-
-    # Healthcare
     "XLV": "healthcare", "JNJ": "healthcare", "UNH": "healthcare",
-    "ISRG": "healthcare", "MRNA": "healthcare",
-
-    # Sustainable
-    "ESGV": "sustainable_ag", "ESGU": "sustainable_ag",
-    "MOO": "sustainable_ag", "SOIL": "sustainable_ag",
-
-    # Tech (neutral)
+    "ESGV": "sustainable_ag", "MOO": "sustainable_ag", "SOIL": "sustainable_ag",
     "AAPL": "technology", "MSFT": "technology", "GOOGL": "technology",
     "NVDA": "technology", "META": "technology", "AMZN": "technology",
-
-    # Finance
     "JPM": "finance", "BAC": "finance", "GS": "finance", "MS": "finance",
-
-    # Fossil fuel
     "XOM": "fossil_fuel", "CVX": "fossil_fuel", "BP": "fossil_fuel",
     "SHEL": "fossil_fuel", "COP": "fossil_fuel", "OXY": "fossil_fuel",
     "XLE": "fossil_fuel",
-
-    # Weapons
     "LMT": "weapons", "RTX": "weapons", "NOC": "weapons",
     "BA": "weapons", "GD": "weapons", "ITA": "weapons",
-
-    # Tobacco
     "MO": "tobacco", "PM": "tobacco", "BTI": "tobacco",
-
-    # Crypto / digital assets (neutral-positive)
-    "BTC-USD": "technology", "ETH-USD": "technology",
-
-    # Indices / broad market
+    # Crypto ecosystem (Mycorrhiza)
+    "BTC-USD": "technology", 
+    "ETH-USD": "crypto_layer1",
+    "SOL-USD": "crypto_layer1", 
+    "ADA-USD": "crypto_layer1",
+    "POL-USD": "crypto_layer2", 
+    "OP-USD": "crypto_layer2",
+    "ARB-USD": "crypto_layer2", 
+    "LDO-USD": "crypto_defi",
+    "LINK-USD": "crypto_oracle",
+    # Broad Indices
     "SPY": "technology", "QQQ": "technology", "IWM": "technology",
-    "DIA": "technology", "GLD": "water",  # Gold in water/resource category
-
-    # Commodities
+    "DIA": "technology", "GLD": "water",
     "GC=F": "water", "CL=F": "fossil_fuel", "SI=F": "water",
     "ZC=F": "sustainable_ag",
-
-    # Private prison
+    # Innovation & Fungi
+    "XBI": "biotech_innovation",
+    "LIT": "clean_energy",
+    "ROBO": "technology",
+    "CMPS": "mycorrhiza_biotech",
+    "ATAI": "mycorrhiza_biotech",
     "GEO": "private_prison", "CXW": "private_prison",
-
-    # Predatory lending
     "SLM": "predatory_lending",
 }
 
@@ -129,7 +118,7 @@ class BenevolenceScore:
     symbol: str
     sector: str
     score: float          # -1.0 (extractive) → +1.0 (syntropic)
-    is_blocked: bool      # True if blocked from LARGE tier
+    fails_lifeguard_protocol: bool      # True if blocked (was is_blocked)
     tier_cap: str         # Maximum allowable tier: NANO | MID | LARGE
     rationale: str
 
@@ -157,6 +146,30 @@ class InfluenceRecord:
     expected_field_contribution: str
 
 
+# ─── Refusal Registry (Sovereignty-first) ───────────────────────────────────
+
+# Explicit "No-Trade" zones based on local or community refusal.
+# Principle: "Refusal without penalty" (ARCHITECTURE.md)
+REFUSAL_REGISTRY = {
+    # Symbols explicitly refused by community mandate
+    "symbols": set(["XOM", "CVX"]), # Example: Fossil fuels refused locally
+    # Sectors explicitly refused
+    "sectors": set(["private_prison", "weapons", "tobacco"]),
+}
+
+def check_refusal(symbol: str) -> tuple[bool, str]:
+    """Check if an instrument is explicitly refused by community mandate."""
+    s = symbol.upper()
+    if s in REFUSAL_REGISTRY["symbols"]:
+        return False, f"SOVEREIGN REFUSAL: Symbol {s} explicitly refused by community."
+    
+    sector = SYMBOL_SECTOR_MAP.get(s, "technology")
+    if sector in REFUSAL_REGISTRY["sectors"]:
+        return False, f"SOVEREIGN REFUSAL: Sector {sector} explicitly refused by community."
+    
+    return True, "Sovereign consent active."
+
+
 # ─── Benevolence scoring ──────────────────────────────────────────────────────
 
 def score_benevolence(symbol: str) -> BenevolenceScore:
@@ -165,7 +178,9 @@ def score_benevolence(symbol: str) -> BenevolenceScore:
     sector = SYMBOL_SECTOR_MAP.get(s, "technology")
     score = SECTOR_SCORES.get(sector, 0.0)
 
-    is_blocked = score <= -0.60  # strong extractive = blocked from LARGE
+    # Lifeguard protocol: do not engage with drowning swimmers (extractive assets) 
+    # at a scale that risks the lifeguard (LARGE tier).
+    fails_lifeguard_protocol = score <= -0.60
 
     if score >= 0.70:
         tier_cap = "LARGE"
@@ -182,9 +197,53 @@ def score_benevolence(symbol: str) -> BenevolenceScore:
 
     return BenevolenceScore(
         symbol=symbol, sector=sector,
-        score=score, is_blocked=is_blocked,
+        score=score, fails_lifeguard_protocol=fails_lifeguard_protocol,
         tier_cap=tier_cap, rationale=rationale
     )
+
+
+def check_mirror_gate(symbol: str, action: str, rationale: str, sas_profile=None) -> tuple[bool, str]:
+    """
+    The Mirror Gate: Does this trade require us to behave like the thing we oppose?
+    
+    Checks for:
+    - Exploitation of information asymmetry
+    - Reliance on opacity
+    - Predatory timing (front-running known distress)
+    """
+    # Hardened wolf markers
+    wolf_markers = [
+        "squeeze", "dump", "pump", "panic", "exploit", "crush", "insider",
+        "front-run", "arbitrage", "predatory", "toxic", "leverage", "trap",
+        "forced", "distress", "liquidation", "hunt", "stop-run"
+    ]
+    
+    if any(m in rationale.lower() for m in wolf_markers):
+        return False, f"Mirror Gate: Rationale contains wolf marker (e.g. '{rationale}')"
+        
+    if sas_profile:
+        # Wolf score > 0.70 or Opacity > 0.80 triggers the gate
+        if getattr(sas_profile, "wolf_score", 0.0) > 0.70:
+            return False, f"Mirror Gate: High wolf score ({sas_profile.wolf_score:.2f}) on symbol"
+        if getattr(sas_profile, "opacity_score", 0.0) > 0.80:
+            return False, f"Mirror Gate: High opacity score ({sas_profile.opacity_score:.2f}) — transparency required"
+
+    return True, "Mirror Gate passed"
+
+
+def check_position_safety(symbol: str, action: str, size_pct: float, nu: float, sts: str) -> tuple[bool, str]:
+    """
+    Checks if the trade size is too aggressive relative to field stability.
+    """
+    # nu < 0.3 means field is fragile. No aggressive sizing.
+    if nu < 0.30 and size_pct > 5.0:
+        return False, f"Position Safety: ν is low ({nu:.2f}), blocking aggressive sizing."
+    
+    # STS state 'DETERIORATING' means world field is collapsing.
+    if sts == "DETERIORATING" and action == "BUY" and size_pct > 2.0:
+        return False, f"Position Safety: STS is {sts}, blocking expansion."
+        
+    return True, "Position safety passed"
 
 
 def apply_governance_tier(
@@ -197,7 +256,7 @@ def apply_governance_tier(
     """
     tier_order = {"NANO": 0, "MID": 1, "LARGE": 2, "WAIT": -1, "BLOCKED": -2}
 
-    if benevolence.is_blocked:
+    if benevolence.fails_lifeguard_protocol:
         return "BLOCKED", benevolence.rationale
 
     req_level = tier_order.get(requested_tier, -1)
@@ -313,7 +372,7 @@ def log_influence(
 
     record = InfluenceRecord(
         symbol=symbol,
-        timestamp=datetime.utcnow().isoformat(),
+        timestamp=datetime.now(timezone.utc).isoformat(),
         action=action,
         tier=tier,
         size_pct=size_pct,

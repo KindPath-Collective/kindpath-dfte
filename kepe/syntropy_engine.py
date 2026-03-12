@@ -220,7 +220,7 @@ def _compute_wfs_from_signals(signals: List[WorldSignal]) -> float:
     num = 0.0
     den = 0.0
     for sig in signals:
-        if sig.confidence > 0.1:
+        if sig.confidence > 0.1 and not np.isnan(sig.value):
             w    = DOMAIN_WEIGHTS.get(sig.domain, 0.10) * sig.confidence
             num += ((sig.value + 1) / 2) * w   # map -1→+1 to 0→1
             den += w

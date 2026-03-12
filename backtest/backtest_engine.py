@@ -36,7 +36,8 @@ import yfinance as yf
 # ── path setup so we can import BMR modules ─────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
-_BMR  = os.path.join(_ROOT, "bmr")
+_KINDROOT = os.path.dirname(_ROOT)
+_BMR  = os.path.join(_KINDROOT, "kindpath-bmr")
 for _p in [_ROOT, _BMR]:
     if _p not in sys.path:
         sys.path.insert(0, _p)

@@ -37,7 +37,7 @@ import os
 import logging
 import requests
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from kepe.indicators import WorldSignal
@@ -88,7 +88,7 @@ class BalticDrySignal:
                     domain="KPRE_FLOW", source=f"bdi_proxy_{ticker.lower()}",
                     region="GLOBAL", value=value, confidence=0.60,
                     evidence_level="TESTABLE",
-                    timestamp=datetime.utcnow(),
+                    timestamp=datetime.now(timezone.utc),
                     temporal_layer="MEDIUM",
                     raw={"ticker": ticker, "trend_20": trend_20,
                          "z_vs_mean": float(z), "price": float(prices.iloc[-1])},
@@ -101,7 +101,7 @@ class BalticDrySignal:
         return WorldSignal(
             domain="KPRE_FLOW", source="bdi_proxy",
             region="GLOBAL", value=0.0, confidence=0.0,
-            evidence_level="TESTABLE", timestamp=datetime.utcnow(),
+            evidence_level="TESTABLE", timestamp=datetime.now(timezone.utc),
             temporal_layer="MEDIUM",
         )
 
@@ -149,7 +149,7 @@ class FreightSignal:
                     domain="KPRE_FLOW", source=f"freight_{ticker.lower()}",
                     region="US", value=value, confidence=0.50,
                     evidence_level="TESTABLE",
-                    timestamp=datetime.utcnow(),
+                    timestamp=datetime.now(timezone.utc),
                     temporal_layer="MEDIUM",
                     raw={"ticker": ticker, "momentum_20d": momentum,
                          "z_vs_mean": float(z)},
@@ -162,7 +162,7 @@ class FreightSignal:
         return WorldSignal(
             domain="KPRE_FLOW", source="freight_proxy",
             region="US", value=0.0, confidence=0.0,
-            evidence_level="TESTABLE", timestamp=datetime.utcnow(),
+            evidence_level="TESTABLE", timestamp=datetime.now(timezone.utc),
             temporal_layer="MEDIUM",
         )
 
@@ -239,7 +239,7 @@ class EnergyGridSignal:
                 domain="KPRE_ENERGY", source="eia_crude_inventory",
                 region="US", value=value, confidence=0.80,
                 evidence_level="ESTABLISHED",
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 temporal_layer="MEDIUM",
                 raw={"weekly_delta_mbbl": weekly_delta,
                      "delta_vs_4wk_avg": delta_vs_avg,
@@ -286,7 +286,7 @@ class EnergyGridSignal:
                 domain="KPRE_ENERGY", source="energy_proxy_uso",
                 region="US", value=value, confidence=0.45,
                 evidence_level="TESTABLE",
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 temporal_layer="MEDIUM",
                 raw={"uso_trend_20d": uso_trend, "xle_vs_xlu": demand_signal},
                 notes=f"Energy proxy (no EIA key): USO trend={uso_trend:.3f}, "
@@ -298,7 +298,7 @@ class EnergyGridSignal:
             return WorldSignal(
                 domain="KPRE_ENERGY", source="energy_proxy",
                 region="US", value=0.0, confidence=0.0,
-                evidence_level="TESTABLE", timestamp=datetime.utcnow(),
+                evidence_level="TESTABLE", timestamp=datetime.now(timezone.utc),
                 temporal_layer="MEDIUM",
             )
 
@@ -362,7 +362,7 @@ class AgriculturalFlowSignal:
                 domain="KPRE_FLOW", source="agricultural_flow",
                 region="GLOBAL", value=value, confidence=0.50,
                 evidence_level="TESTABLE",
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 temporal_layer="MEDIUM",
                 raw={"moo_gld_ratio_trend": ratio_trend, "moo_trend": moo_trend},
                 notes=f"Agri proxy MOO/GLD: ratio_trend={ratio_trend:.3f}, "
@@ -374,7 +374,7 @@ class AgriculturalFlowSignal:
             return WorldSignal(
                 domain="KPRE_FLOW", source="agricultural_flow",
                 region="GLOBAL", value=0.0, confidence=0.0,
-                evidence_level="TESTABLE", timestamp=datetime.utcnow(),
+                evidence_level="TESTABLE", timestamp=datetime.now(timezone.utc),
                 temporal_layer="MEDIUM",
             )
 
@@ -425,7 +425,7 @@ class PortCongestionSignal:
                     domain="KPRE_FLOW", source=f"port_proxy_{ticker.lower()}",
                     region="GLOBAL", value=value, confidence=0.40,
                     evidence_level="SPECULATIVE",
-                    timestamp=datetime.utcnow(),
+                    timestamp=datetime.now(timezone.utc),
                     temporal_layer="SURFACE",
                     raw={"ticker": ticker, "z_vs_60d_mean": float(z),
                          "momentum_20d": momentum,
@@ -441,7 +441,7 @@ class PortCongestionSignal:
         return WorldSignal(
             domain="KPRE_FLOW", source="port_proxy",
             region="GLOBAL", value=0.0, confidence=0.0,
-            evidence_level="SPECULATIVE", timestamp=datetime.utcnow(),
+            evidence_level="SPECULATIVE", timestamp=datetime.now(timezone.utc),
             temporal_layer="SURFACE",
         )
 
@@ -496,7 +496,7 @@ class KPRELayer:
                 domain="KPRE", source="physical_flow_composite",
                 region="GLOBAL", value=0.0, confidence=0.0,
                 evidence_level="TESTABLE",
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 temporal_layer="MEDIUM",
                 notes="No KPRE sub-signals available"
             )
@@ -527,7 +527,7 @@ class KPRELayer:
             value=float(np.clip(composite_value, -1, 1)),
             confidence=float(np.clip(composite_conf, 0, 0.70)),
             evidence_level=ev_final,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             temporal_layer="MEDIUM",
             raw={
                 "n_signals":    len(sub_signals),

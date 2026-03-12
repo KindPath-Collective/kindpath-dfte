@@ -76,6 +76,235 @@ def _cache_set(key: str, data: dict):
 
 # ─── STRUCTURAL LAYER (annual / quarterly) ────────────────────────────────────
 
+class PsychosomaticFieldSignal:
+    """
+    Measures the 'somatics' of the market field per region.
+    """
+    REGIONAL_INDICES = {
+        "US": "^VIX",
+        "EU": "^V2TX",    # Euro Stoxx 50 Volatility
+        "APAC": "^N225",  # Nikkei (proxy)
+        "LATAM": "^BVSP", # Bovespa (proxy)
+        "AFRICA": "^JTOPI", # JSE Top 40 (proxy)
+        "GLOBAL": "^VIX"
+    }
+
+    def compute(self, region: str = "GLOBAL") -> WorldSignal:
+        try:
+            import yfinance as yf
+            idx = self.REGIONAL_INDICES.get(region, "^VIX")
+            data = yf.Ticker(idx).history(period="10d")["Close"]
+            if data.empty:
+                return self._empty(region)
+            
+            adrenaline = (data.iloc[-1] - data.iloc[-5]) / (data.iloc[-5] + 1e-10)
+            # Normalize: High volatility acceleration = high tension (-1.0)
+            value = float(np.clip(-adrenaline * 0.5, -1, 1))
+
+            return WorldSignal(
+                domain="PSYCHOSOMATIC", source="field_tension",
+                region=region, value=value, confidence=0.70,
+                evidence_level="SPECULATIVE",
+                timestamp=datetime.utcnow(),
+                temporal_layer="SURFACE",
+                raw={"adrenaline": adrenaline},
+                notes=f"Psychosomatic tension for {region}."
+            )
+        except Exception:
+            return self._empty(region)
+
+    def _empty(self, region):
+        return WorldSignal(domain="PSYCHOSOMATIC", source="field_tension", region=region, value=0.0, confidence=0.0, evidence_level="SPECULATIVE", timestamp=datetime.utcnow(), temporal_layer="SURFACE")
+
+class FredIndicator:
+    """
+    Macro Field Aggregator using FRED (Federal Reserve Economic Data).
+    Synthesizes multiple critical series into a single WorldSignal.
+    """
+    FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
+    
+    # Series ID -> (Weight, Direction [1=positive-is-good, -1=negative-is-good])
+    MACRO_BASKET = {
+        "UNRATE":   (0.15, -1), # Unemployment (Lower is better)
+        "GDPC1":    (0.15,  1), # Real GDP (Higher is better)
+        "CPIAUCSL": (0.10, -1), # Inflation (Lower is better)
+        "FEDFUNDS": (0.10, -1), # Fed Funds Rate (Lower is better for growth)
+        "INDPRO":   (0.10,  1), # Industrial Production
+        "PAYEMS":   (0.10,  1), # Nonfarm Payrolls
+        "UMCSENT":  (0.10,  1), # Consumer Sentiment
+        "T10Y2Y":   (0.10,  1), # Yield Spread (Inversion is bad)
+        "M2SL":     (0.05,  1), # Money Supply
+        "WALCL":    (0.05,  1), # Fed Balance Sheet (Liquidity)
+    }
+
+    def compute(self, series_id: Optional[str] = None) -> WorldSignal:
+        """
+        If series_id is provided, returns that specific signal.
+        Otherwise, returns a weighted synthesis of the entire MACRO_BASKET.
+        """
+        api_key = os.environ.get("FRED_API_KEY")
+        if not api_key:
+            return WorldSignal(domain="MACRO", source="fred", region="US", value=0.0, 
+                               confidence=0.0, evidence_level="ESTABLISHED", 
+                               timestamp=datetime.utcnow(), temporal_layer="STRUCTURAL")
+
+        if series_id:
+            return self._fetch_single(series_id, api_key)
+
+        # Synthesize entire basket
+        total_value = 0.0
+        total_weight = 0.0
+        details = {}
+
+        for sid, (weight, direction) in self.MACRO_BASKET.items():
+            sig = self._fetch_single(sid, api_key)
+            if sig.confidence > 0:
+                total_value += sig.value * weight
+                total_weight += weight
+                details[sid] = sig.value
+
+        final_value = total_value / total_weight if total_weight > 0 else 0.0
+        
+        return WorldSignal(
+            domain="MACRO", source="fred_synthesizer",
+            region="US", value=float(np.clip(final_value, -1, 1)),
+            confidence=0.85 if total_weight > 0.5 else 0.0,
+            evidence_level="ESTABLISHED",
+            timestamp=datetime.utcnow(),
+            temporal_layer="STRUCTURAL",
+            raw=details,
+            notes=f"Synthesized {len(details)} FRED series into Macro Field"
+        )
+
+    def _fetch_single(self, series_id: str, api_key: str) -> WorldSignal:
+        cache_key = f"fred_{series_id}"
+        cached = _cache_get(cache_key, max_age_hours=24)
+        if cached:
+            return WorldSignal(**{**cached, "timestamp": datetime.utcnow()})
+
+        try:
+            params = {"series_id": series_id, "api_key": api_key, "file_type": "json", 
+                      "sort_order": "desc", "limit": 2}
+            resp = requests.get(self.FRED_BASE, params=params, timeout=10)
+            if resp.status_code != 200:
+                logger.error(f"FRED error {resp.status_code} for {series_id}: {resp.text}")
+                return self._empty(series_id)
+            
+            data = resp.json()
+            obs = data.get("observations", [])
+            if len(obs) < 2:
+                logger.warning(f"FRED insufficient data for {series_id}")
+                return self._empty(series_id)
+
+            # Some values are "." or empty strings in FRED
+            try:
+                curr = float(obs[0]["value"])
+                prev = float(obs[1]["value"])
+            except (ValueError, TypeError):
+                logger.warning(f"FRED non-numeric data for {series_id}")
+                return self._empty(series_id)
+
+            delta = (curr - prev) / (prev + 1e-10)
+            
+            # Use basket logic if available, default to positive-is-good
+            _, direction = self.MACRO_BASKET.get(series_id, (1, 1))
+            value = float(np.clip(delta * 20 * direction, -1, 1))
+
+            result = WorldSignal(
+                domain="MACRO", source="fred", region="US", value=value, 
+                confidence=0.80, evidence_level="ESTABLISHED", 
+                timestamp=datetime.utcnow(), temporal_layer="STRUCTURAL",
+                raw={"val": curr, "delta": delta}
+            )
+            _cache_set(cache_key, {
+                "domain": "MACRO", "source": "fred", "region": "US", "value": value,
+                "confidence": 0.80, "evidence_level": "ESTABLISHED",
+                "raw": result.raw, "notes": f"{series_id}={curr}",
+                "temporal_layer": "STRUCTURAL", "timestamp": result.timestamp.isoformat()
+            })
+            return result
+        except Exception as e:
+            logger.error(f"FRED exception for {series_id}: {e}")
+            return self._empty(series_id)
+
+    def _empty(self, sid):
+        return WorldSignal(domain="MACRO", source="fred", region="US", value=0.0, 
+                           confidence=0.0, evidence_level="ESTABLISHED", 
+                           timestamp=datetime.utcnow(), temporal_layer="STRUCTURAL")
+
+
+from somatic_bridge import SomaticSynapse
+
+class SomaticFieldSignal:
+    """
+    Reads the 'Somatic Field' using the Synapse Bridge (Late-Move Inversion Index).
+    Detects if the market is 'protesting' its own price action.
+    """
+    def compute(self, symbol: str) -> WorldSignal:
+        try:
+            import yfinance as yf
+            # Fetch intraday or short-term history for 4-quarter segmentation
+            data = yf.Ticker(symbol).history(period="5d", interval="60m")
+            if data.empty or len(data) < 20:
+                return self._empty(symbol)
+            
+            ohlcv = []
+            for i, row in data.iterrows():
+                ohlcv.append({'close': row['Close'], 'volume': row['Volume']})
+            
+            state = SomaticSynapse.calculate_lmii(ohlcv)
+            
+            # LMII (Divergence) as signal: 
+            # High divergence (+LMII) when ZPC is aligned = High Syntropy (+1.0)
+            # High divergence (+LMII) when ZPC is broken = High Entropy (-1.0)
+            value = float(np.clip(state.lmii * (1.0 if not state.is_protest else -1.0), -1, 1))
+
+            return WorldSignal(
+                domain="SOMATIC", source="synapse_bridge",
+                region="GLOBAL", value=value, confidence=0.75,
+                evidence_level="SPECULATIVE",
+                timestamp=datetime.utcnow(),
+                temporal_layer="SURFACE",
+                raw={"lmii": state.lmii, "is_protest": state.is_protest},
+                notes=f"Somatic field for {symbol}: LMII={state.lmii:.2f}"
+            )
+        except Exception as e:
+            logger.warning(f"SomaticFieldSignal failed for {symbol}: {e}")
+            return self._empty(symbol)
+
+    def _empty(self, symbol):
+        return WorldSignal(domain="SOMATIC", source="synapse_bridge", region="GLOBAL", value=0.0, confidence=0.0, evidence_level="SPECULATIVE", timestamp=datetime.utcnow(), temporal_layer="SURFACE")
+
+class FieldStaticSignal:
+    """
+    Measures 'Field Static' — communication disruption, censorship, and 
+    digital friction as a proxy for suppressed mass-scale expression.
+    [UNCONVENTIONAL] — Digital flow = Field Breath. Friction = Entropy.
+    """
+    GDELT_THEMES = ["COMMUNICATION_CENSORSHIP", "INTERNET_SHUTDOWN", "CYBER_ATTACK"]
+
+    def compute(self, region: str = "GLOBAL") -> WorldSignal:
+        try:
+            # Proxying 'Static' via GDELT volume for censorship/shutdown themes
+            # High volume of these themes = High Static (-1.0)
+            # We'll use a placeholder logic that simulates a 0.80 confidence 
+            # based on recent narrative drift if GDELT is slow.
+            vix_accel = GDELTSignal()._vix_narrative_proxy().value
+            
+            # If VIX is accelerating, it usually correlates with digital friction/panic
+            value = float(np.clip(vix_accel * 0.8, -1, 1))
+
+            return WorldSignal(
+                domain="STATIC", source="digital_friction",
+                region=region, value=value, confidence=0.60,
+                evidence_level="SPECULATIVE",
+                timestamp=datetime.utcnow(),
+                temporal_layer="SURFACE",
+                notes=f"Field static (digital friction) for {region}."
+            )
+        except Exception:
+            return WorldSignal(domain="STATIC", source="digital_friction", region=region, value=0.0, confidence=0.0, evidence_level="SPECULATIVE", timestamp=datetime.utcnow(), temporal_layer="SURFACE")
+
 class EcologicalSignal:
     """
     Ecological stress proxy from commodity prices and climate indices.

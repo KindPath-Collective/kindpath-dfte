@@ -23,12 +23,12 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger(__name__)
 
 _HERE   = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(_HERE, "signal_history.db")
+DB_PATH = os.environ.get("SIGNAL_DB_PATH", os.path.join(_HERE, "signal_history.db"))
 
 # Schema version — bump if schema changes (triggers migration warning)
 SCHEMA_VERSION = 1
@@ -83,7 +83,30 @@ CREATE TABLE IF NOT EXISTS signals (
     sar              REAL,
     trade_type       TEXT,
     -- metadata
-    run_mode         TEXT DEFAULT 'paper'
+    run_mode         TEXT DEFAULT 'paper',
+    -- Task 7: governance
+    governance_check_passed INTEGER DEFAULT 1,
+    -- Task 1: FRED extended
+    revision_delta           TEXT,    -- JSON {series_id: delta}
+    pre_release_window       INTEGER, -- 0/1: any core series within 3 days of release
+    fred_update_today        INTEGER, -- 0/1: any core series updated in last 24h
+    regional_vs_national_gap REAL,   -- NSW unemployment vs national (positive = NSW worse)
+    -- Task 2: relational timestamp (Northern NSW, Bundjalung Country -28.65, 153.56)
+    solar_elevation      REAL,   -- degrees above horizon at signal time
+    solar_arc_phase      REAL,   -- 0=midnight, 0.5=solar noon, 1=next midnight
+    lunar_phase          REAL,   -- 0=new moon, 0.5=full moon, 1=next new moon
+    season_southern      TEXT,   -- SUMMER|AUTUMN|WINTER|SPRING
+    market_phase         TEXT,   -- JSON {symbol: PREOPEN|OPEN|MID|CLOSE|AFTERHOURS}
+    cross_market_overlap INTEGER, -- 0/1: 2+ major markets simultaneously open
+    session_arc          TEXT,   -- JSON {symbol: float 0→1} fraction through session
+    boundary_proximity   REAL,   -- 0→1: 1=at open/close boundary, 0=session midpoint
+    -- Task 4: vicarious field layer
+    vicarious_impact     REAL,
+    perceived_intensity  REAL,
+    tension_load         REAL,
+    is_drowning          INTEGER, -- 0/1
+    -- Task 3: ratio tracker
+    echo_stability_score REAL    -- mean field ratio deviation (lower = more stable)
 )
 """
 
@@ -108,6 +131,51 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT
 )
 """
+
+# Task 3: ratio history and missing strings tables
+_CREATE_RATIO_HISTORY = """
+CREATE TABLE IF NOT EXISTS ratio_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_id   INTEGER REFERENCES signals(id),
+    timestamp   TEXT NOT NULL,
+    pair_name   TEXT NOT NULL,   -- e.g. 'C1_C2'
+    ratio_value REAL
+)
+"""
+
+_CREATE_MISSING_STRINGS = """
+CREATE TABLE IF NOT EXISTS missing_strings (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp        TEXT NOT NULL,
+    pair_name        TEXT NOT NULL,
+    actual_ratio     REAL,
+    predicted_ratio  REAL,
+    gap_magnitude    REAL
+)
+"""
+
+# Columns added after initial schema release — applied via ALTER TABLE
+_NEW_COLUMNS: List[tuple] = [
+    # (table, column_name, type_def)
+    ("signals", "governance_check_passed", "INTEGER DEFAULT 1"),
+    ("signals", "revision_delta",           "TEXT"),
+    ("signals", "pre_release_window",       "INTEGER"),
+    ("signals", "fred_update_today",        "INTEGER"),
+    ("signals", "regional_vs_national_gap", "REAL"),
+    ("signals", "solar_elevation",          "REAL"),
+    ("signals", "solar_arc_phase",          "REAL"),
+    ("signals", "lunar_phase",              "REAL"),
+    ("signals", "season_southern",          "TEXT"),
+    ("signals", "market_phase",             "TEXT"),
+    ("signals", "cross_market_overlap",     "INTEGER"),
+    ("signals", "session_arc",              "TEXT"),
+    ("signals", "boundary_proximity",       "REAL"),
+    ("signals", "vicarious_impact",         "REAL"),
+    ("signals", "perceived_intensity",      "REAL"),
+    ("signals", "tension_load",             "REAL"),
+    ("signals", "is_drowning",              "INTEGER"),
+    ("signals", "echo_stability_score",     "REAL"),
+]
 
 
 # ─── Connection context manager ───────────────────────────────────────────────
@@ -148,6 +216,14 @@ class SignalLogger:
             con.execute(_CREATE_SIGNALS)
             con.execute(_CREATE_OUTCOMES)
             con.execute(_CREATE_META)
+            con.execute(_CREATE_RATIO_HISTORY)
+            con.execute(_CREATE_MISSING_STRINGS)
+            
+            # Indexes for performance
+            con.execute("CREATE INDEX IF NOT EXISTS idx_signals_sym_ts ON signals(symbol, timestamp)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_sym_ts ON outcomes(symbol, signal_ts)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_signal_id ON outcomes(signal_id)")
+
             # Store schema version
             con.execute(
                 "INSERT OR IGNORE INTO meta VALUES ('schema_version', ?)",
@@ -157,17 +233,28 @@ class SignalLogger:
                 "INSERT OR IGNORE INTO meta VALUES ('created_at', ?)",
                 (datetime.now(timezone.utc).isoformat(),)
             )
+            # Migrations: add new columns to existing databases
+            for table, col, col_def in _NEW_COLUMNS:
+                try:
+                    con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
+                except Exception:
+                    pass  # Column already exists — safe to ignore
         logger.debug(f"SignalLogger: schema ready at {self.db_path}")
 
     def log_signal(
         self,
         symbol: str,
-        dfte_signal,              # DFTESignal
-        kepe_profile,             # KEPEProfile
-        sas_profile=None,         # SASProfile | None
-        cmam_profile=None,        # CMAMProfile | None
-        trade_classification=None, # TradeClassification | None
+        dfte_signal,                   # DFTESignal
+        kepe_profile,                  # KEPEProfile
+        sas_profile=None,              # SASProfile | None
+        cmam_profile=None,             # CMAMProfile | None
+        trade_classification=None,     # TradeClassification | None
         run_mode: str = "paper",
+        governance_check_passed: bool = True,
+        relational_ts=None,            # RelationalTimestamp | None
+        vicarious_ts=None,             # VicariousSignal | None
+        fred_meta: Optional[Dict] = None,  # FREDMeta | None
+        echo_stability: Optional[float] = None,
     ) -> int:
         """
         Log one signal reading. Returns the new row id.
@@ -177,7 +264,8 @@ class SignalLogger:
             return self._insert_signal(
                 symbol, dfte_signal, kepe_profile,
                 sas_profile, cmam_profile, trade_classification,
-                run_mode,
+                run_mode, governance_check_passed, relational_ts,
+                vicarious_ts, fred_meta, echo_stability,
             )
         except Exception as e:
             logger.warning(f"SignalLogger.log_signal failed for {symbol}: {e}")
@@ -192,6 +280,11 @@ class SignalLogger:
         cmam,
         tc,
         run_mode: str,
+        governance_check_passed: bool = True,
+        relational_ts=None,
+        vicarious_ts=None,
+        fred_meta: Optional[Dict] = None,
+        echo_stability: Optional[float] = None,
     ) -> int:
         # ── KEPE fields ──────────────────────────────────────────────────────
         domain = getattr(kepe, "domain_scores", {}) or {}
@@ -202,84 +295,128 @@ class SignalLogger:
         language_score     = domain.get("LANGUAGE", None)
 
         # ── SAS fields ───────────────────────────────────────────────────────
-        sas_score       = getattr(sas, "sas_score",       None) if sas else None
-        wolf_score      = getattr(sas, "wolf_score",      None) if sas else None
-        opacity_score   = getattr(sas, "opacity_score",   None) if sas else None
-        rev_coherence   = getattr(sas, "revenue_coherence", None) if sas else None
-        capex_dir       = getattr(sas, "capex_direction", None) if sas else None
-        ssi_gap         = getattr(sas, "ssi_gap",         None) if sas else None
+        sas_score     = getattr(sas, "sas_score",        None) if sas else None
+        wolf_score    = getattr(sas, "wolf_score",       None) if sas else None
+        opacity_score = getattr(sas, "opacity_score",    None) if sas else None
+        rev_coherence = getattr(sas, "revenue_coherence",None) if sas else None
+        capex_dir     = getattr(sas, "capex_direction",  None) if sas else None
+        ssi_gap       = getattr(sas, "ssi_gap",          None) if sas else None
 
         # ── CMAM fields ──────────────────────────────────────────────────────
-        cmam_mode = getattr(cmam, "mode", None) if cmam else None
-        sar       = getattr(cmam, "sar",  None) if cmam else None
-        trade_type = getattr(tc, "trade_type", None) if tc else None
+        cmam_mode  = getattr(cmam, "mode",       None) if cmam else None
+        sar        = getattr(cmam, "sar",         None) if cmam else None
+        trade_type = getattr(tc,   "trade_type",  None) if tc   else None
 
-        row = (
-            SCHEMA_VERSION,
-            datetime.now(timezone.utc).isoformat(),
-            symbol,
+        # ── Relational timestamp fields ───────────────────────────────────────
+        rt = relational_ts
+        solar_elevation      = getattr(rt, "solar_elevation",      None)
+        solar_arc_phase      = getattr(rt, "solar_arc_phase",      None)
+        lunar_phase          = getattr(rt, "lunar_phase",          None)
+        season_southern      = getattr(rt, "season_southern",      None)
+        market_phase_json    = json.dumps(getattr(rt, "market_phase",   {})) if rt else None
+        cross_market_overlap = (1 if getattr(rt, "cross_market_overlap", False) else 0) if rt else None
+        session_arc_json     = json.dumps(getattr(rt, "session_arc",    {})) if rt else None
+        boundary_proximity   = getattr(rt, "boundary_proximity",   None)
+
+        # ── Vicarious field fields ────────────────────────────────────────────
+        vts = vicarious_ts
+        vicarious_impact    = getattr(vts, "impact_magnitude",      None)
+        perceived_intensity = getattr(vts, "perceived_intensity_db", None)
+        tension_load        = getattr(vts, "tension_load",          None)
+        is_drowning         = (1 if getattr(vts, "is_drowning", False) else 0) if vts else None
+
+        # ── FRED metadata fields ──────────────────────────────────────────────
+        fm = fred_meta or {}
+        revision_delta           = json.dumps(fm.get("revision_delta", {})) if fm else None
+        pre_release_window       = (1 if fm.get("pre_release_window") else 0) if fm else None
+        fred_update_today        = (1 if fm.get("fred_update_today")  else 0) if fm else None
+        regional_vs_national_gap = fm.get("regional_vs_national_gap") if fm else None
+
+        # ── Build column→value dict (easier to extend than a fixed tuple) ────
+        ts = getattr(sig, "timestamp", None)
+        if isinstance(ts, datetime):
+            ts_iso = ts.isoformat()
+        else:
+            ts_iso = datetime.now(timezone.utc).isoformat()
+
+        row: Dict[str, Any] = {
+            "schema_version":   SCHEMA_VERSION,
+            "timestamp":        ts_iso,
+            "symbol":           symbol,
             # BMR
-            getattr(sig, "nu",          None),
-            getattr(sig, "mfs",         None),
-            getattr(sig, "mfs_label",   None),
-            getattr(sig, "field_state", None),
-            getattr(sig, "lsii",        None),
-            getattr(sig, "lsii_flag",   None),
-            getattr(sig, "curvature_k", None),
+            "nu":               getattr(sig, "nu",           None),
+            "mfs":              getattr(sig, "mfs",          None),
+            "mfs_label":        getattr(sig, "mfs_label",    None),
+            "field_state":      getattr(sig, "field_state",  None),
+            "lsii":             getattr(sig, "lsii",         None),
+            "lsii_flag":        getattr(sig, "lsii_flag",    None),
+            "curvature":        getattr(sig, "curvature_k",  None),
             # KEPE
-            getattr(kepe, "wfs",               None),
-            getattr(kepe, "wfs_label",         None),
-            getattr(kepe, "spi",               None),
-            getattr(kepe, "opc",               None),
-            getattr(kepe, "entropy_indicator", None),
-            getattr(kepe, "interference_load", None),
-            getattr(kepe, "sts",               None),
-            json.dumps(wfs_history),
-            json.dumps(domain),
-            kpre_score,
-            kpre_capital_score,
-            language_score,
+            "wfs":              getattr(kepe, "wfs",               None),
+            "wfs_label":        getattr(kepe, "wfs_label",         None),
+            "spi":              getattr(kepe, "spi",               None),
+            "opc":              getattr(kepe, "opc",               None),
+            "ei":               getattr(kepe, "entropy_indicator", None),
+            "interference_load":getattr(kepe, "interference_load", None),
+            "sts_state":        getattr(kepe, "sts",               None),
+            "wfs_history":      json.dumps(wfs_history),
+            "domain_scores":    json.dumps(domain),
+            "kpre_score":           kpre_score,
+            "kpre_capital_score":   kpre_capital_score,
+            "language_score":       language_score,
             # SAS
-            sas_score, wolf_score, opacity_score,
-            rev_coherence, capex_dir, ssi_gap,
+            "sas_score":        sas_score,
+            "wolf_score":       wolf_score,
+            "opacity_score":    opacity_score,
+            "revenue_coherence":rev_coherence,
+            "capex_direction":  capex_dir,
+            "ssi_gap":          ssi_gap,
             # DFTE
-            getattr(sig, "action",           None),
-            getattr(sig, "tier",             None),
-            getattr(sig, "conviction",       None),
-            getattr(sig, "position_size_pct", None),
-            getattr(sig, "rationale",        None),
-            1 if getattr(sig, "all_gates_passed", False) else 0,
+            "action":           getattr(sig, "action",           None),
+            "tier":             getattr(sig, "tier",             None),
+            "conviction":       getattr(sig, "conviction",       None),
+            "position_size":    getattr(sig, "position_size_pct",None),
+            "rationale":        getattr(sig, "rationale",        None),
+            "all_gates_passed": 1 if getattr(sig, "all_gates_passed", False) else 0,
             # CMAM
-            cmam_mode, sar, trade_type,
-            run_mode,
-        )
+            "cmam_mode":        cmam_mode,
+            "sar":              sar,
+            "trade_type":       trade_type,
+            # Metadata
+            "run_mode":         run_mode,
+            # Task 7
+            "governance_check_passed": 1 if governance_check_passed else 0,
+            # Task 1 FRED
+            "revision_delta":           revision_delta,
+            "pre_release_window":       pre_release_window,
+            "fred_update_today":        fred_update_today,
+            "regional_vs_national_gap": regional_vs_national_gap,
+            # Task 2 relational timestamp
+            "solar_elevation":          solar_elevation,
+            "solar_arc_phase":          solar_arc_phase,
+            "lunar_phase":              lunar_phase,
+            "season_southern":          season_southern,
+            "market_phase":             market_phase_json,
+            "cross_market_overlap":     cross_market_overlap,
+            "session_arc":              session_arc_json,
+            "boundary_proximity":       boundary_proximity,
+            # Task 4 vicarious field
+            "vicarious_impact":         vicarious_impact,
+            "perceived_intensity":      perceived_intensity,
+            "tension_load":             tension_load,
+            "is_drowning":              is_drowning,
+            # Task 3 ratio tracker
+            "echo_stability_score":     echo_stability,
+        }
+
+        col_names    = ", ".join(row.keys())
+        placeholders = ", ".join("?" * len(row))
 
         with _connection(self.db_path) as con:
-            cur = con.execute("""
-                INSERT INTO signals (
-                    schema_version, timestamp, symbol,
-                    nu, mfs, mfs_label, field_state, lsii, lsii_flag, curvature,
-                    wfs, wfs_label, spi, opc, ei, interference_load,
-                    sts_state, wfs_history, domain_scores,
-                    kpre_score, kpre_capital_score, language_score,
-                    sas_score, wolf_score, opacity_score,
-                    revenue_coherence, capex_direction, ssi_gap,
-                    action, tier, conviction, position_size, rationale,
-                    all_gates_passed,
-                    cmam_mode, sar, trade_type,
-                    run_mode
-                ) VALUES (
-                    ?,?,?,
-                    ?,?,?,?,?,?,?,
-                    ?,?,?,?,?,?,
-                    ?,?,?,
-                    ?,?,?,
-                    ?,?,?,?,?,?,
-                    ?,?,?,?,?,?,
-                    ?,?,?,
-                    ?
-                )
-            """, row)
+            cur = con.execute(
+                f"INSERT INTO signals ({col_names}) VALUES ({placeholders})",
+                list(row.values()),
+            )
             signal_id = cur.lastrowid
 
         logger.debug(f"Logged signal id={signal_id} {symbol} {getattr(sig, 'action', '?')}")
@@ -291,6 +428,7 @@ class SignalLogger:
         self,
         symbol: Optional[str] = None,
         days: int = 180,
+        limit: int = 1000,
     ) -> List[Dict]:
         """
         Return signal rows as list of dicts, newest first.
@@ -300,13 +438,13 @@ class SignalLogger:
         with _connection(self.db_path) as con:
             if symbol:
                 rows = con.execute(
-                    "SELECT * FROM signals WHERE symbol=? AND timestamp>=? ORDER BY timestamp DESC",
-                    (symbol, cutoff)
+                    "SELECT * FROM signals WHERE symbol=? AND timestamp>=? ORDER BY timestamp DESC LIMIT ?",
+                    (symbol, cutoff, limit)
                 ).fetchall()
             else:
                 rows = con.execute(
-                    "SELECT * FROM signals WHERE timestamp>=? ORDER BY timestamp DESC",
-                    (cutoff,)
+                    "SELECT * FROM signals WHERE timestamp>=? ORDER BY timestamp DESC LIMIT ?",
+                    (cutoff, limit)
                 ).fetchall()
         return [dict(r) for r in rows]
 

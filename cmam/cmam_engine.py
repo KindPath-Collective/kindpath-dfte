@@ -49,6 +49,7 @@ _DEFAULT_SHORT_CAP   = 0.15
 @dataclass
 class CMAMProfile:
     fund_value:      float
+    maturity_score:  float   # 0.0 (Seed/Growth) -> 1.0 (Mature/Benevolence)
     sar:             float   # current syntropy allocation ratio 0 → SAR_max
     st_allocation:   float
     lt_allocation:   float
@@ -154,9 +155,23 @@ class CMAMEngine:
     def profile(self, fund_value: float, short_used: float = 0.0) -> CMAMProfile:
         """
         Compute a CMAMProfile for the current fund state.
-        Caches result for subsequent classify_trade calls. [TESTABLE]
+        Maturity score is logarithmic: 0.0 at X1, 1.0 at X2.
         """
         sar = self.compute_sar(fund_value)
+        
+        # Calculate Maturity Score (M)
+        if fund_value <= self.x1:
+            maturity = 0.0
+        elif fund_value >= self.x2:
+            maturity = 1.0
+        else:
+            # Logarithmic transition: growth focus shifts to benevolence
+            import numpy as np
+            maturity = float(np.clip(
+                (np.log10(fund_value) - np.log10(self.x1)) / 
+                (np.log10(self.x2) - np.log10(self.x1)), 
+                0, 1
+            ))
 
         if fund_value < self.x1:
             mode = "ST_MODE"
@@ -170,6 +185,7 @@ class CMAMEngine:
 
         p = CMAMProfile(
             fund_value      = fund_value,
+            maturity_score  = maturity,
             sar             = sar,
             st_allocation   = 1.0 - sar,
             lt_allocation   = sar,

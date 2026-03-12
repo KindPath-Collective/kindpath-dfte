@@ -6,3 +6,19 @@ __pycache__/
 /tmp/dfte_*.json
 *.log
 .DS_Store
+venv/
+.venv/
+logs/
+
+# Runtime state files
+logger/*.db
+logger/*.db-shm
+logger/*.db-wal
+backtest/*.db
+backtest/*.pkl
+backtest/lightning_report.txt
+backtest/wisdom_cache.json
+backtest/wisdom_mega.json
+*_wallet_state.json
+wallet_state.json
+raw_field_data/

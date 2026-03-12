@@ -10,18 +10,6 @@ A trade is only executed when BOTH fields are favourable.
 MFS without WFS = technical without ethics.
 WFS without MFS = impact without timing.
 Together = the first syntropy-governed, benevolence-first trading engine.
-
-Trade tier logic:
-  NANO   — pure market physics. KEPE is background filter only.
-           Governs: no shorting syntropic assets, no trading extractive
-  MID    — hybrid. WFS modulates MFS conviction.
-           Governs: WFS ≥ 0.40 required, equity_weight applied
-  LARGE  — impact-first. WFS is primary selector.
-           Governs: WFS ≥ 0.60 required, syntropic assets preferred,
-                    extractive assets blocked, ν × UCS governs size
-
-Position sizing:
-  base_size × ν × equity_weight × opc_modifier × risk_budget
 """
 
 from __future__ import annotations
@@ -29,7 +17,7 @@ import numpy as np
 import logging
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +132,6 @@ def wfs_gate(kepe: KEPESummary, tier: str) -> tuple[bool, str]:
         return False, f"BLOCKED: extractive asset — conflicts with KindPath sovereignty principles"
 
     if tier == "NANO":
-        # Nano: only block extractive assets, otherwise pass
         return True, "WFS gate: NANO passed (world field is background filter)"
 
     elif tier == "MID":
@@ -167,27 +154,18 @@ def wfs_gate(kepe: KEPESummary, tier: str) -> tuple[bool, str]:
 
 
 def determine_tier(bmr: BMRSummary, kepe: KEPESummary) -> str:
-    """
-    Determine appropriate tier from both field readings.
-    LARGE > MID > NANO, downgrade if either field insufficient.
-    """
-    # BMR tier recommendation is starting point
+    """Determine appropriate tier from both field readings."""
     bmr_tier = bmr.trade_tier
-
-    # WFS gates modify tier
     if bmr_tier == "LARGE":
         if kepe.wfs < 0.55 or kepe.is_extractive:
             bmr_tier = "MID"
         if kepe.is_syntropic and kepe.wfs >= 0.60:
-            return "LARGE"  # confirmed
-
+            return "LARGE"
     if bmr_tier == "MID":
         if kepe.wfs < 0.35:
             bmr_tier = "NANO"
-
     if bmr_tier == "WAIT":
         return "WAIT"
-
     return bmr_tier
 
 
@@ -196,41 +174,58 @@ def compute_position_size(
     kepe: KEPESummary,
     tier: str,
     base_risk_pct: float = 1.0,
+    maturity_score: float = 0.0,
 ) -> tuple[float, float]:
-    """
-    Returns (position_size_pct, risk_pct).
-
-    Size formula: base_risk × ν × equity_weight × opc_modifier × tier_scale
-
-    tier_scale: NANO=0.25, MID=0.5, LARGE=1.0
-    """
-    tier_scales = {"NANO": 0.25, "MID": 0.5, "LARGE": 1.0, "WAIT": 0.0}
+    """Returns (position_size_pct, risk_pct)."""
+    tier_scales = {"NANO": 0.15, "MID": 0.5, "LARGE": 1.0, "WAIT": 0.0}
     tier_scale = tier_scales.get(tier, 0.0)
+    if tier_scale == 0.0: return 0.0, 0.0
 
-    if tier_scale == 0.0:
-        return 0.0, 0.0
-
-    # ν modulates conviction
     nu = bmr.nu
-
-    # OPC from KEPE — forward faith
     opc = kepe.opc
-    opc_mod = float(0.5 + opc * 0.5)  # 0.5 → 1.0
+    opc_mod = float(0.5 + opc * 0.5)
+    equity_boost = 1.0 + (maturity_score * (kepe.equity_weight - 1.0))
+    equity_w = float(np.clip(equity_boost, 0.5, 2.5))
 
-    # Equity weight (syntropic assets get size boost)
-    equity_w = float(np.clip(kepe.equity_weight, 0, 2.0))
+    mfs_weight = 0.7 - (maturity_score * 0.5) 
+    wfs_weight = 0.3 + (maturity_score * 0.5) 
+    conviction = float(np.clip((bmr.mfs * mfs_weight) + (kepe.wfs * wfs_weight), 0, 1))
 
-    # Conviction: MFS × WFS product (both fields must agree)
-    conviction = float(np.clip(bmr.mfs * 2 * kepe.wfs * 2 / 4, 0, 1))
-
-    # Position size
     pos_size = base_risk_pct * nu * opc_mod * equity_w * tier_scale * conviction
-    pos_size = float(np.clip(pos_size, 0, 10.0))  # max 10% per trade
+    if tier == "NANO":
+        pos_size = float(np.clip(pos_size, 0.1, 1.0))
+    else:
+        pos_size = float(np.clip(pos_size, 0, 10.0))
 
-    # Risk: tighter stops for lower conviction
     risk_pct = float(np.clip(base_risk_pct * (0.5 + conviction * 0.5), 0.1, 2.0))
-
     return pos_size, risk_pct
+
+
+def compute_lateral_wisdom(
+    bmr: BMRSummary,
+    kepe: KEPESummary,
+    somatic_value: float = 0.0,
+    static_value: float = 0.0,
+    historical_edge: float = 1.0
+) -> tuple[float, str]:
+    """Consensus of lateral vantage points + Field Memory."""
+    wisdom_mod = 1.0 * historical_edge
+    notes = []
+    if historical_edge > 1.0: notes.append("Field Memory (Edge)")
+    elif historical_edge < 1.0: notes.append("Field Memory (Dampen)")
+
+    if bmr.direction > 0 and somatic_value < -0.3:
+        wisdom_mod *= 0.7
+        notes.append("Somatic Shadow")
+    if static_value < -0.5:
+        wisdom_mod *= 0.8
+        notes.append("High Static")
+    if (bmr.direction > 0 and kepe.wfs < 0.45) or (bmr.direction < 0 and kepe.wfs > 0.55):
+        wisdom_mod *= 0.5
+        notes.append("Field Dissonance")
+
+    wisdom_note = ", ".join(notes) if notes else "Lateral Harmony"
+    return float(np.clip(wisdom_mod, 0.1, 1.25)), wisdom_note
 
 
 # ─── Main DFTE Engine ─────────────────────────────────────────────────────────
@@ -239,93 +234,80 @@ def synthesise_dfte_signal(
     bmr: BMRSummary,
     kepe: KEPESummary,
     base_risk_pct: float = 1.0,
+    maturity_score: float = 0.0,
+    somatic_value: float = 0.0,
+    static_value: float = 0.0,
+    historical_edge: float = 1.0,
+    override_timestamp: Optional[datetime] = None
 ) -> DFTESignal:
-    """
-    Synthesise both field readings into a unified trade signal.
-    This is the core DFTE decision function.
-    """
+    """Synthesise both field readings + Lateral Wisdom into a unified signal."""
     symbol = bmr.symbol
+    ts = override_timestamp if override_timestamp else datetime.now(timezone.utc)
 
-    # Determine tier
+    # 0. Clean NaN values
+    mfs_val = float(bmr.mfs) if not np.isnan(bmr.mfs) else 0.5
+    wfs_val = float(kepe.wfs) if not np.isnan(kepe.wfs) else 0.5
+    nu_val  = float(bmr.nu)  if not np.isnan(bmr.nu)  else 0.0
+    somatic_val = float(somatic_value) if not np.isnan(somatic_value) else 0.0
+    static_val  = float(static_value)  if not np.isnan(static_value)  else 0.0
+
+    # 1. Lateral Wisdom Consensus (LWL)
+    wisdom_mod, wisdom_note = compute_lateral_wisdom(
+        bmr, kepe, somatic_val, static_val, historical_edge
+    )
+
+    # 2. Determine tier
     tier = determine_tier(bmr, kepe)
 
     # Run gates
     mfs_pass, mfs_reason = mfs_gate(bmr, tier)
     wfs_pass, wfs_reason = wfs_gate(kepe, tier)
-
-    # Governance gate (additional checks)
-    governance_pass = True
-    governance_reason = "Governance gate: passed"
-    warnings = []
-
-    if kepe.is_extractive:
-        governance_pass = False
-        governance_reason = f"GOVERNANCE BLOCK: {symbol} is extractive — KindPath sovereignty principle"
-
-    if bmr.lsii_flag in ("high", "very_high") and tier in ("MID", "LARGE"):
-        warnings.append(f"LSII-Price {bmr.lsii_flag}: late-move arc break detected — reduce size")
-
-    if kepe.interference_load > 0.5:
-        warnings.append(f"Interference load {kepe.interference_load:.2f}: contradictory world field")
-
+    governance_pass = not kepe.is_extractive
+    governance_reason = "Governance gate: passed" if governance_pass else f"BLOCK: {symbol} extractive"
     all_gates = mfs_pass and wfs_pass and governance_pass
 
-    # Conviction score
-    conviction = float(np.clip(
-        bmr.mfs * 0.45 + kepe.wfs * 0.35 + bmr.nu * 0.20,
-        0, 1
-    ))
+    # Conviction Shift (Maturity-linked) + Wisdom Modulation
+    mfs_w = 0.7 - (maturity_score * 0.5)
+    wfs_w = 0.3 + (maturity_score * 0.5)
+    conviction = float(np.clip(((mfs_val * mfs_w) + (wfs_val * wfs_w)) * wisdom_mod, 0, 1))
 
-    # Action
+    # Action logic with ZPC
+    zpc_threshold = 0.5 if wisdom_mod > 0.9 else 0.65
+    zpc_aligned = (bmr.direction > 0 and wfs_val > zpc_threshold) or \
+                  (bmr.direction < 0 and wfs_val < (1.0 - zpc_threshold))
+
     if kepe.is_extractive:
         action = "BLOCKED"
         pos_size, risk_pct = 0.0, 0.0
-    elif not all_gates or tier == "WAIT":
+    elif not all_gates or tier == "WAIT" or wisdom_mod < 0.4:
         action = "HOLD"
         pos_size, risk_pct = 0.0, 0.0
-    elif bmr.direction > 0.15:
+    elif bmr.direction > 0.15 and zpc_aligned:
         action = "BUY"
-        pos_size, risk_pct = compute_position_size(bmr, kepe, tier, base_risk_pct)
-    elif bmr.direction < -0.15:
+        pos_size, risk_pct = compute_position_size(bmr, kepe, tier, base_risk_pct, maturity_score)
+        pos_size *= wisdom_mod
+    elif bmr.direction < -0.15 and zpc_aligned:
         action = "SELL"
-        pos_size, risk_pct = compute_position_size(bmr, kepe, tier, base_risk_pct)
-        pos_size = -pos_size  # short position
+        pos_size, risk_pct = compute_position_size(bmr, kepe, tier, base_risk_pct, maturity_score)
+        pos_size = -(pos_size * wisdom_mod)
     else:
         action = "HOLD"
         pos_size, risk_pct = 0.0, 0.0
 
     # Rationale
     rationale_parts = [
-        f"Tier={tier} | MFS={bmr.mfs:.2f} [{bmr.mfs_label}] | WFS={kepe.wfs:.2f} [{kepe.wfs_label}]",
-        f"ν={bmr.nu:.3f} | SPI={kepe.spi:.2f} | OPC={kepe.opc:.2f}",
-        f"Gates: MFS={'✓' if mfs_pass else '✗'} ({mfs_reason}) | "
-        f"WFS={'✓' if wfs_pass else '✗'} ({wfs_reason}) | "
-        f"GOV={'✓' if governance_pass else '✗'}",
+        f"Tier={tier} | MFS={mfs_val:.2f} | WFS={wfs_val:.2f} | ν={nu_val:.3f} | M={maturity_score:.2f}",
+        f"Wisdom={wisdom_mod:.2f} [{wisdom_note}]",
+        f"Gates: M={'✓' if mfs_pass else '✗'} W={'✓' if wfs_pass else '✗'} G={'✓' if governance_pass else '✗'}",
     ]
-    if kepe.is_syntropic:
-        rationale_parts.append(f"Syntropic asset — equity weight ×{kepe.equity_weight}")
+    if kepe.is_syntropic: rationale_parts.append(f"Syntropic (x{kepe.equity_weight})")
     rationale = " | ".join(rationale_parts)
 
     return DFTESignal(
-        symbol=symbol,
-        timestamp=datetime.utcnow(),
-        action=action,
-        tier=tier,
-        conviction=conviction,
-        direction=bmr.direction,
-        position_size_pct=abs(pos_size),
-        risk_pct=risk_pct,
-        mfs=bmr.mfs,
-        wfs=kepe.wfs,
-        nu=bmr.nu,
-        ucs=kepe.unified_curvature,
-        mfs_gate=mfs_pass,
-        wfs_gate=wfs_pass,
-        governance_gate=governance_pass,
-        all_gates_passed=all_gates,
-        sts=kepe.sts,
-        sts_position=kepe.sts_position,
-        rationale=rationale,
-        warnings=warnings,
-        evidence_level="TESTABLE",
+        symbol=symbol, timestamp=ts, action=action, tier=tier,
+        conviction=conviction, direction=bmr.direction, position_size_pct=abs(pos_size),
+        risk_pct=risk_pct, mfs=mfs_val, wfs=wfs_val, nu=nu_val, ucs=kepe.unified_curvature,
+        mfs_gate=mfs_pass, wfs_gate=wfs_pass, governance_gate=governance_pass,
+        all_gates_passed=all_gates, sts=kepe.sts, sts_position=kepe.sts_position,
+        rationale=rationale, warnings=[], evidence_level="TESTABLE",
     )
