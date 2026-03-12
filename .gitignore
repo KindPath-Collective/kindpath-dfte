@@ -22,3 +22,4 @@ backtest/wisdom_mega.json
 *_wallet_state.json
 wallet_state.json
 raw_field_data/
+local_data/

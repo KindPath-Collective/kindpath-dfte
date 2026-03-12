@@ -18,16 +18,24 @@ Evidence posture inherited from KINDFIELD:
 """
 
 from __future__ import annotations
+import csv
 import os
 import time
 import logging
 import requests
 import numpy as np
+import urllib.request
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger(__name__)
+
+try:
+    from scripts.local_data_cache import LocalDataCache
+    _cache = LocalDataCache()
+except Exception:
+    _cache = None
 
 
 # ─── Core data types ──────────────────────────────────────────────────────────
@@ -82,7 +90,18 @@ class OHLCVFeed:
 
     def _fetch_yahoo(self, symbol: str, timeframe: str,
                      periods: int) -> List[OHLCV]:
-        """Yahoo Finance via yfinance library."""
+        """Yahoo Finance via yfinance library, with local cache-first."""
+        # Cache-first: only daily bars are cached (intraday changes too fast)
+        if _cache and timeframe == "1d":
+            cached = _cache.get_ohlcv(symbol, timeframe, min_bars=periods, max_age_hours=25)
+            if cached:
+                return [OHLCV(
+                    timestamp=datetime.fromisoformat(b["timestamp"].replace("Z", "+00:00").split("+")[0]),
+                    open=b["open"], high=b["high"], low=b["low"],
+                    close=b["close"], volume=b["volume"],
+                    symbol=symbol, timeframe=timeframe,
+                ) for b in cached[-periods:]]
+
         try:
             import yfinance as yf
         except ImportError:
@@ -116,6 +135,15 @@ class OHLCVFeed:
                 symbol=symbol,
                 timeframe=timeframe,
             ))
+
+        # Store daily bars in cache
+        if _cache and timeframe == "1d" and bars:
+            _cache.put_ohlcv(symbol, timeframe, [
+                {"timestamp": b.timestamp.isoformat(), "open": b.open, "high": b.high,
+                 "low": b.low, "close": b.close, "volume": b.volume}
+                for b in bars
+            ])
+
         return bars[-periods:]
 
 
@@ -507,6 +535,7 @@ class MacroSignal:
     """
 
     FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
+    FRED_CSV_BASE = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 
     SERIES = {
         "yield_curve": "T10Y2Y",    # 10yr-2yr spread (recession proxy)
@@ -520,21 +549,20 @@ class MacroSignal:
         self.api_key = os.environ.get("FRED_API_KEY", "")
 
     def compute(self, symbol: str = "MACRO") -> RawSignal:
-        if not self.api_key:
-            logger.warning("FRED_API_KEY not set — sovereign macro signal unavailable")
-            return RawSignal(
-                scale="SOVEREIGN", source="macro_fred",
-                symbol=symbol, value=0.0, confidence=0.0,
-                evidence_level="ESTABLISHED",
-                timestamp=datetime.utcnow(),
-                notes="Set FRED_API_KEY env var for macro signal"
-            )
         try:
             scores = {}
             for name, series_id in self.SERIES.items():
+                # Cache-first
+                if _cache:
+                    cached_val = _cache.get_macro(series_id, max_age_days=3)
+                    if cached_val is not None:
+                        scores[name] = cached_val
+                        continue
                 val = self._fetch_latest(series_id)
                 if val is not None:
                     scores[name] = val
+                    if _cache:
+                        _cache.put_macro(series_id, val, datetime.utcnow().strftime("%Y-%m-%d"))
 
             if not scores:
                 raise ValueError("No FRED data retrieved")
@@ -566,22 +594,39 @@ class MacroSignal:
             )
 
     def _fetch_latest(self, series_id: str) -> Optional[float]:
-        params = {
-            "series_id": series_id,
-            "api_key": self.api_key,
-            "file_type": "json",
-            "limit": "1",
-            "sort_order": "desc",
-        }
+        """Fetch most recent FRED observation. Uses JSON API if key set, else free CSV."""
+        if self.api_key:
+            params = {
+                "series_id": series_id,
+                "api_key": self.api_key,
+                "file_type": "json",
+                "limit": "1",
+                "sort_order": "desc",
+            }
+            try:
+                resp = requests.get(self.FRED_BASE, params=params, timeout=8)
+                data = resp.json()
+                obs = data.get("observations", [])
+                if obs:
+                    val = obs[0].get("value", ".")
+                    return float(val) if val != "." else None
+            except Exception as e:
+                logger.warning(f"FRED JSON {series_id}: {e}")
+
+        # Free CSV endpoint — no API key required
         try:
-            resp = requests.get(self.FRED_BASE, params=params, timeout=8)
-            data = resp.json()
-            obs = data.get("observations", [])
-            if obs:
-                val = obs[0].get("value", ".")
-                return float(val) if val != "." else None
+            url = f"{self.FRED_CSV_BASE}?id={series_id}"
+            req = urllib.request.Request(url, headers={"User-Agent": "KindPath-Bot/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                content = resp.read().decode("utf-8")
+            reader = csv.reader(content.splitlines())
+            next(reader)  # skip header
+            rows = [(date, val) for date, val in reader if val and val != "."]
+            if rows:
+                _, val = rows[-1]
+                return float(val)
         except Exception as e:
-            logger.warning(f"FRED {series_id}: {e}")
+            logger.warning(f"FRED CSV {series_id}: {e}")
         return None
 
 

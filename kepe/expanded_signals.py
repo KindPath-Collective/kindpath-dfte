@@ -7,6 +7,7 @@ All raw data is logged to the 'All Data Matters' archive.
 
 from __future__ import annotations
 import logging
+import os
 import httpx
 import numpy as np
 import re
@@ -18,6 +19,14 @@ from governance.governance_layer import SYMBOL_SECTOR_MAP
 
 logger = logging.getLogger(__name__)
 
+SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8888")
+
+try:
+    from scripts.local_data_cache import LocalDataCache
+    _cache = LocalDataCache()
+except Exception:
+    _cache = None
+
 class WikipediaAttentionSignal:
     """
     Measures public attention shifts via Wikipedia pageviews.
@@ -27,22 +36,42 @@ class WikipediaAttentionSignal:
     def compute(self, symbol: str, topic: str = None) -> WorldSignal:
         topic = topic or self._map_symbol_to_topic(symbol)
         try:
+            # Cache-first: avoid network call if fresh data exists
+            if _cache:
+                cached_views = _cache.get_wikipedia(topic, max_age_hours=24)
+                if cached_views:
+                    views = cached_views[-7:]
+                    if len(views) >= 2:
+                        avg_view = np.mean(views[:-1])
+                        last_view = views[-1]
+                        spike = (last_view - avg_view) / (avg_view + 1e-10)
+                        val = float(np.clip(spike, -1, 1))
+                        return WorldSignal(
+                            domain="ATTENTION", source="wikipedia",
+                            region="GLOBAL", value=val, confidence=0.50,
+                            evidence_level="TESTABLE",
+                            timestamp=datetime.now(timezone.utc),
+                            temporal_layer="SURFACE",
+                            raw={"views_7d": views},
+                            notes=f"Wiki pageviews for {topic} (cached): {spike:+.2%} spike"
+                        )
+
             headers = {"User-Agent": "KindPath-Bot/1.0 (sam@kindpath.org)"}
             # Wikipedia API expects dates in YYYYMMDD format
             # We fetch from start of year to today to get enough history for mean
             today = datetime.now(timezone.utc).strftime("%Y%m%d")
             url = f"https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/en.wikipedia/all-access/all-agents/{topic}/daily/20260101/{today}"
-            
+
             with httpx.Client(headers=headers, timeout=10) as client:
                 r = client.get(url)
-                
+
                 # LOG RAW DATA
                 get_raw_logger().log(
-                    source="wikipedia", 
+                    source="wikipedia",
                     data=r.json() if r.status_code == 200 else r.text,
                     metadata={"symbol": symbol, "topic": topic, "status": r.status_code}
                 )
-                
+
                 if r.status_code != 200:
                     return WorldSignal(domain="ATTENTION", source="wikipedia", region="GLOBAL", value=0.0, confidence=0.0, evidence_level="TESTABLE", timestamp=datetime.now(timezone.utc))
 
@@ -51,16 +80,20 @@ class WikipediaAttentionSignal:
                 if not items:
                     return WorldSignal(domain="ATTENTION", source="wikipedia", region="GLOBAL", value=0.0, confidence=0.0, evidence_level="TESTABLE", timestamp=datetime.now(timezone.utc))
 
-                views = [item["views"] for item in items[-7:]] 
+                # Store in cache for future calls
+                if _cache:
+                    _cache.put_wikipedia(topic, items)
+
+                views = [item["views"] for item in items[-7:]]
                 if len(views) < 2:
                     return WorldSignal(domain="ATTENTION", source="wikipedia", region="GLOBAL", value=0.0, confidence=0.0, evidence_level="TESTABLE", timestamp=datetime.now(timezone.utc))
 
-                
+
                 avg_view = np.mean(views[:-1])
                 last_view = views[-1]
                 spike = (last_view - avg_view) / (avg_view + 1e-10)
                 val = float(np.clip(spike, -1, 1))
-                
+
                 return WorldSignal(
                     domain="ATTENTION", source="wikipedia",
                     region="GLOBAL", value=val, confidence=0.50,
@@ -103,29 +136,46 @@ class GoogleTrendsSignal:
     Leading indicator for 'distracted glances' (retail FOMO).
     """
     def compute(self, symbol: str) -> WorldSignal:
+        query = f"{symbol} stock price"
         try:
-            # Note: No official free API. We use a search-scrape proxy.
+            # Try SearXNG first (sovereign, in-house search)
+            r = httpx.get(
+                f"{SEARXNG_URL}/search",
+                params={"q": query, "format": "json"},
+                timeout=5,
+            )
+            data = r.json()
+            results = data.get("results", [])
+            # Use result count as a proxy for search interest (normalised 0–1)
+            result_count = len(results)
+            interest = float(np.clip(result_count / 10.0, 0.0, 1.0)) * 2 - 1  # scale to [-1, 1]
+            get_raw_logger().log(source="searxng", data={"result_count": result_count}, metadata={"symbol": symbol, "query": query})
+            return WorldSignal(
+                domain="ATTENTION", source="google_trends",
+                region="GLOBAL", value=interest, confidence=0.30,
+                evidence_level="TESTABLE",
+                timestamp=datetime.now(timezone.utc),
+                temporal_layer="SURFACE",
+                notes=f"Search interest for {symbol} via SearXNG: {result_count} results"
+            )
+        except Exception:
+            pass
+
+        # Fall back to direct Google scrape
+        try:
             headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
-            query = f"{symbol}+stock+price"
-            url = f"https://www.google.com/search?q={query}"
-            
+            url = f"https://www.google.com/search?q={query.replace(' ', '+')}"
             with httpx.Client(headers=headers, timeout=10) as client:
                 r = client.get(url)
-                # LOG RAW DATA
                 get_raw_logger().log(source="google_search_meta", data=r.text[:5000], metadata={"symbol": symbol})
-                
-                # Heuristic: search result density or existence of "People also ask"
-                # For now, return stable neutral to avoid false noise
-                interest = 0.0 
-
-                return WorldSignal(
-                    domain="ATTENTION", source="google_trends",
-                    region="GLOBAL", value=interest, confidence=0.20,
-                    evidence_level="TESTABLE",
-                    timestamp=datetime.now(timezone.utc),
-                    temporal_layer="SURFACE",
-                    notes=f"Search interest for {symbol}: STABLE"
-                )
+            return WorldSignal(
+                domain="ATTENTION", source="google_trends",
+                region="GLOBAL", value=0.0, confidence=0.20,
+                evidence_level="TESTABLE",
+                timestamp=datetime.now(timezone.utc),
+                temporal_layer="SURFACE",
+                notes=f"Search interest for {symbol}: STABLE (google fallback)"
+            )
         except Exception:
             return WorldSignal(domain="ATTENTION", source="google_trends", region="GLOBAL", value=0.0, confidence=0.0, evidence_level="TESTABLE", timestamp=datetime.now(timezone.utc))
 
@@ -233,21 +283,43 @@ class LocalWeatherSignal:
     
     def compute(self) -> WorldSignal:
         try:
+            # Cache-first: weather valid for 3 hours
+            if _cache:
+                cached = _cache.get_weather(self.LAT, self.LON, max_age_hours=3)
+                if cached:
+                    cloud = cached.get("cloud_cover", 0)
+                    energy_level = 1.0 - (cloud / 100.0)
+                    val = (energy_level * 2) - 1.0
+                    return WorldSignal(
+                        domain="ECOLOGICAL", source="local_weather",
+                        region="BUNDJALUNG", value=val, confidence=0.80,
+                        evidence_level="ESTABLISHED",
+                        timestamp=datetime.now(timezone.utc),
+                        temporal_layer="SURFACE",
+                        raw=cached,
+                        notes=f"Local weather (cached): {cached.get('temperature_2m')}°C"
+                    )
+
             url = f"https://api.open-meteo.com/v1/forecast?latitude={self.LAT}&longitude={self.LON}&current=temperature_2m,rain,cloud_cover,wind_speed_10m&timezone=Australia%2FSydney"
-            
+
             with httpx.Client(timeout=10) as client:
                 r = client.get(url)
                 get_raw_logger().log(source="open_meteo", data=r.json() if r.status_code == 200 else r.text, metadata={"lat": self.LAT, "lon": self.LON})
-                
+
                 if r.status_code != 200:
                     return WorldSignal(domain="ECOLOGICAL", source="local_weather", region="GLOBAL", value=0.0, confidence=0.0, evidence_level="ESTABLISHED", timestamp=datetime.now(timezone.utc))
-                
+
                 data = r.json()
                 current = data.get("current", {})
+
+                # Store in cache
+                if _cache:
+                    _cache.put_weather(self.LAT, self.LON, current)
+
                 cloud = current.get("cloud_cover", 0)
                 energy_level = 1.0 - (cloud / 100.0)
                 val = (energy_level * 2) - 1.0
-                
+
                 return WorldSignal(
                     domain="ECOLOGICAL", source="local_weather",
                     region="BUNDJALUNG", value=val, confidence=0.80,

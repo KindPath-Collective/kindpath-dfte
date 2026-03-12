@@ -1,0 +1,60 @@
+# SearXNG settings for KindPath
+# Minimal config: JSON API enabled, no tracking, offline-first
+
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "KindPath Search"
+  privacypolicy_url: false
+  contact_url: false
+  enable_metrics: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  formats:
+    - html
+    - json
+
+server:
+  secret_key: "kindpath-local-only-not-public"
+  bind_address: "0.0.0.0"
+  port: 8080
+  base_url: "http://localhost:8888/"
+  image_proxy: false
+  http_protocol_version: "1.0"
+  method: "GET"
+
+ui:
+  static_use_hash: false
+
+enabled_plugins:
+  - 'Hash plugin'
+  - 'Self Information'
+
+# Only enable sources we trust
+engines:
+  - name: google
+    engine: google
+    shortcut: g
+    disabled: false
+
+  - name: bing
+    engine: bing
+    shortcut: b
+    disabled: false
+
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: d
+    disabled: false
+
+outgoing:
+  request_timeout: 8.0
+  max_request_timeout: 15.0
+  useragent_suffix: ""
+  pool_connections: 100
+  pool_maxsize: 20
+  enable_http2: true

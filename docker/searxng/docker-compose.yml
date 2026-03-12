@@ -1,0 +1,29 @@
+# SearXNG — self-hosted, privacy-first search engine
+# Replaces Google scraping in kepe/expanded_signals.py
+#
+# Start:  docker compose -f docker/searxng/docker-compose.yml up -d
+# Stop:   docker compose -f docker/searxng/docker-compose.yml down
+# API:    http://localhost:8888/search?q=<query>&format=json
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: kindpath-searxng
+    ports:
+      - "8888:8080"
+    volumes:
+      - ./settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8888
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "1m"
+        max-file: "1"
