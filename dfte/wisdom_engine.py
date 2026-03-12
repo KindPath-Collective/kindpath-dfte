@@ -322,3 +322,36 @@ def _build_basket_narrative(
 
     return " ".join(parts)
 
+
+# ─── Convenience presets ──────────────────────────────────────────────────────
+
+def compare_benchmark_basket(db_path: str = "") -> dict:
+    """
+    Convenience: compare the canonical SPY / BTC-USD / GLD benchmark basket.
+
+    These three symbols represent three distinct economic fields:
+      SPY     — broad US equity field (manufacturing, capital, labour)
+      BTC-USD — decentralised monetary field (open network value)
+      GLD     — physical store of value field (systemic fear proxy)
+
+    When the three diverge strongly the system is under tension.
+    When they converge, aggregate capital is moving with rare coherence.
+
+    Returns the full BasketWisdom dict from analyse_basket().
+    If db_path is empty, attempts to locate the default KEPE db automatically.
+    """
+    if not db_path:
+        # Try to resolve relative to the DFTE repo root
+        import os
+        default_paths = [
+            os.path.join(os.path.dirname(__file__), "..", "logger", "kepe_signals.db"),
+            os.path.expanduser("~/.kindpath/kepe_signals.db"),
+        ]
+        for candidate in default_paths:
+            if os.path.exists(candidate):
+                db_path = candidate
+                break
+
+    bw = BasketWisdom(db_path or "")
+    return bw.analyse_basket(["SPY", "BTC-USD", "GLD"])
+

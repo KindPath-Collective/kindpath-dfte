@@ -67,6 +67,7 @@ from kepe.expanded_signals import (
     GoogleTrendsSignal, SocialInfluenceSynthesizer, SectorCoherenceSignal
 )
 from kepe.crypto_signals import CoinGeckoSignal
+from kepe.forgazi_sentiment import ForgaziEngine
 from kepe.syntropy_engine import synthesise_kepe_profile, KEPEProfile
 from cmam.cmam_engine import CMAMEngine, CMAMProfile, TradeClassification
 from sas.sas_engine import SASEngine, SASProfile
@@ -351,7 +352,8 @@ def fetch_bmr_signal(symbol: str, timeframe: str = "1d") -> Optional[BMRSummary]
 
 def collect_raw_signals(
     symbol: str,
-    market_curvature_k: Optional[float] = None
+    market_curvature_k: Optional[float] = None,
+    relational_ts: Optional[RelationalTimestamp] = None,
 ) -> List:
     """
     Collect all raw World Signals for a symbol.
@@ -502,6 +504,33 @@ def collect_raw_signals(
                 signals.append(cg_sig)
     except Exception as e:
         logger.warning(f"CoinGeckoSignal failed for {symbol}: {e}")
+
+    # Forgazi Sentiment Signal — language field from Yahoo RSS + GDELT headlines
+    try:
+        forgazi_sig = ForgaziEngine().analyse(symbol)
+        if forgazi_sig.confidence > 0:
+            signals.append(forgazi_sig)
+            logger.debug(
+                f"Forgazi [{symbol}]: {forgazi_sig.sentiment:+.3f} "
+                f"(conf={forgazi_sig.confidence:.2f}, "
+                f"{forgazi_sig.article_count} articles, "
+                f"contradiction={forgazi_sig.contradiction_flag})"
+            )
+    except Exception as e:
+        logger.warning(f"ForgaziEngine failed for {symbol}: {e}")
+
+    # Apply relational timestamp market-phase weighting if available
+    if relational_ts is not None:
+        phase = getattr(relational_ts, 'market_phase', {}).get(symbol, 'neutral')
+        phase_weight = {
+            'expansion': 1.1, 'contraction': 0.9, 'neutral': 1.0,
+            'peak': 0.95, 'trough': 1.05,
+        }.get(phase, 1.0)
+        if phase_weight != 1.0:
+            for sig in signals:
+                if hasattr(sig, 'confidence') and sig.confidence > 0:
+                    sig.confidence = min(sig.confidence * phase_weight, 1.0)
+            logger.debug(f"RelationalTS [{symbol}]: phase={phase}, weight={phase_weight:.2f}")
 
     return signals
 
@@ -684,7 +713,10 @@ def run_basket(
         fred_future = executor.submit(FredIndicator().compute)
 
         # 2. Parallel Symbol Signal Collection
-        sym_futures = {executor.submit(collect_raw_signals, s, 0.0): s for s in symbols}
+        sym_futures = {
+            executor.submit(collect_raw_signals, s, 0.0, relational_ts): s
+            for s in symbols
+        }
 
         # Collect results
         for f in as_completed(reg_futures):
