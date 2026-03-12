@@ -137,21 +137,75 @@ class FredIndicator:
         "WALCL":    (0.05,  1), # Fed Balance Sheet (Liquidity)
     }
 
+    def _load_cached_pickle(self) -> dict:
+        """
+        Read FRED data from the backtest pickle cache (created by
+        backtest/fetch_sim_data.py).  Returns dict of series_id → DataFrame,
+        or {} if the cache file is absent or stale (>7 days old).
+        """
+        import pickle
+        import time
+        # Look for the cache relative to this file's location (kepe/ → project root)
+        here = os.path.dirname(os.path.abspath(__file__))
+        cache_path = os.path.join(here, "..", "backtest", "fred_data_cache.pkl")
+        cache_path = os.path.normpath(cache_path)
+        if not os.path.exists(cache_path):
+            return {}
+        # Treat cache as stale after 7 days
+        if time.time() - os.path.getmtime(cache_path) > 7 * 86400:
+            return {}
+        try:
+            with open(cache_path, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            return {}
+
+    def _signal_from_cache(self, series_id: str, cache: dict) -> Optional["WorldSignal"]:
+        """
+        Convert cached DataFrame for series_id into a WorldSignal.
+        Returns None if series is not present or has insufficient data.
+        """
+        df = cache.get(series_id)
+        if df is None or len(df) < 2:
+            return None
+        try:
+            df = df.sort_values("Date")
+            curr = float(df["Value"].iloc[-1])
+            prev = float(df["Value"].iloc[-2])
+            delta = (curr - prev) / (prev + 1e-10)
+            _, direction = self.MACRO_BASKET.get(series_id, (1, 1))
+            value = float(np.clip(delta * 20 * direction, -1, 1))
+            return WorldSignal(
+                domain="MACRO", source="fred_cache", region="US", value=value,
+                confidence=0.60,  # Lower than live: data may be days old
+                evidence_level="ESTABLISHED",
+                timestamp=datetime.utcnow(), temporal_layer="STRUCTURAL",
+                raw={"val": curr, "delta": delta},
+                notes=f"{series_id}={curr} (from backtest cache)",
+            )
+        except Exception:
+            return None
+
     def compute(self, series_id: Optional[str] = None) -> WorldSignal:
         """
         If series_id is provided, returns that specific signal.
         Otherwise, returns a weighted synthesis of the entire MACRO_BASKET.
+        Priority: live FRED API → backtest pickle cache → zero/silent fallback.
         """
         api_key = os.environ.get("FRED_API_KEY")
         if not api_key:
-            return WorldSignal(domain="MACRO", source="fred", region="US", value=0.0, 
-                               confidence=0.0, evidence_level="ESTABLISHED", 
+            # Try backtest pickle cache before going silent
+            cache = self._load_cached_pickle()
+            if cache:
+                return self._synthesize_from_cache(cache, series_id)
+            return WorldSignal(domain="MACRO", source="fred", region="US", value=0.0,
+                               confidence=0.0, evidence_level="ESTABLISHED",
                                timestamp=datetime.utcnow(), temporal_layer="STRUCTURAL")
 
         if series_id:
             return self._fetch_single(series_id, api_key)
 
-        # Synthesize entire basket
+        # Synthesize entire basket from live API
         total_value = 0.0
         total_weight = 0.0
         details = {}
@@ -226,6 +280,35 @@ class FredIndicator:
         except Exception as e:
             logger.error(f"FRED exception for {series_id}: {e}")
             return self._empty(series_id)
+
+    def _synthesize_from_cache(self, cache: dict, series_id: Optional[str] = None) -> "WorldSignal":
+        """Synthesize a WorldSignal from the backtest pickle cache instead of the live API."""
+        if series_id:
+            sig = self._signal_from_cache(series_id, cache)
+            return sig if sig is not None else self._empty(series_id)
+
+        total_value = 0.0
+        total_weight = 0.0
+        details = {}
+        for sid, (weight, _) in self.MACRO_BASKET.items():
+            sig = self._signal_from_cache(sid, cache)
+            if sig is not None and sig.confidence > 0:
+                total_value += sig.value * weight
+                total_weight += weight
+                details[sid] = sig.value
+
+        if total_weight == 0:
+            return self._empty("macro_basket")
+
+        return WorldSignal(
+            domain="MACRO", source="fred_cache_synthesizer",
+            region="US", value=float(np.clip(total_value / total_weight, -1, 1)),
+            confidence=0.60,
+            evidence_level="ESTABLISHED",
+            timestamp=datetime.utcnow(), temporal_layer="STRUCTURAL",
+            raw=details,
+            notes=f"Synthesized {len(details)} FRED series from backtest cache",
+        )
 
     def _empty(self, sid):
         return WorldSignal(domain="MACRO", source="fred", region="US", value=0.0, 
